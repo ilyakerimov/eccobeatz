@@ -6,6 +6,8 @@ import path from "path";
 import fs from "fs";
 import { fileURLToPath } from "url";
 import dotenv from "dotenv";
+import jwt from "jsonwebtoken";
+import bcrypt from "bcryptjs";
 
 dotenv.config();
 
@@ -14,7 +16,7 @@ const __dirname = path.dirname(__filename);
 
 const PORT = process.env.PORT || 4000;
 const MONGO_URI = process.env.MONGO_URI || "mongodb://127.0.0.1:27017/beats";
-const ADMIN_SECRET = process.env.ADMIN_KEY || "defaultSecret";
+const JWT_SECRET = process.env.JWT_SECRET || "defaultJwtSecret";
 const BASE_URL = process.env.BASE_URL || `http://localhost:${PORT}`;
 
 const app = express();
@@ -60,7 +62,7 @@ mongoose.connect(MONGO_URI, {
   process.exit(1);
 });
 
-// Model
+// Models
 const Beat = mongoose.model("Beat", {
   title: String,
   genre: String,
@@ -73,6 +75,30 @@ const Beat = mongoose.model("Beat", {
   featured: { type: Boolean, default: false },
   description: String
 });
+
+const Admin = mongoose.model("Admin", {
+  username: { type: String, required: true, unique: true },
+  password: { type: String, required: true }
+});
+
+// Create default admin if not exists
+async function createDefaultAdmin() {
+  try {
+    const adminExists = await Admin.findOne({ username: "admin" });
+    if (!adminExists) {
+      const hashedPassword = await bcrypt.hash("admin123", 10);
+      const admin = new Admin({
+        username: "admin",
+        password: hashedPassword
+      });
+      await admin.save();
+      console.log("Default admin created: admin / admin123");
+    }
+  } catch (error) {
+    console.error("Error creating default admin:", error);
+  }
+}
+createDefaultAdmin();
 
 // Multer configuration
 const storage = multer.diskStorage({
@@ -100,18 +126,51 @@ function addBaseUrlToBeats(beats) {
   return beats;
 }
 
-// Admin authentication middleware
-function checkAdmin(req, res, next) {
+// JWT authentication middleware
+function authenticateToken(req, res, next) {
   const authHeader = req.headers["authorization"];
-  if (!authHeader || authHeader !== `Bearer ${ADMIN_SECRET}`) {
-    return res.status(403).json({ message: "Access denied" });
+  const token = authHeader && authHeader.split(" ")[1];
+
+  if (!token) {
+    return res.status(401).json({ message: "Access token required" });
   }
-  next();
+
+  jwt.verify(token, JWT_SECRET, (err, user) => {
+    if (err) {
+      return res.status(403).json({ message: "Invalid or expired token" });
+    }
+    req.user = user;
+    next();
+  });
 }
 
 // Health check endpoint
 app.get("/health", (req, res) => {
   res.status(200).json({ status: "OK", message: "Server is running" });
+});
+
+// Admin login endpoint
+app.post("/admin/login", async (req, res) => {
+  try {
+    const { username, password } = req.body;
+
+    const admin = await Admin.findOne({ username });
+    if (!admin) {
+      return res.status(401).json({ message: "Invalid credentials" });
+    }
+
+    const validPassword = await bcrypt.compare(password, admin.password);
+    if (!validPassword) {
+      return res.status(401).json({ message: "Invalid credentials" });
+    }
+
+    const token = jwt.sign({ userId: admin._id, username: admin.username }, JWT_SECRET, { expiresIn: "24h" });
+
+    res.json({ token, username: admin.username });
+  } catch (e) {
+    console.error("Login error:", e);
+    res.status(500).json({ message: "Login failed" });
+  }
 });
 
 // Get all beats with genre filter
@@ -147,7 +206,7 @@ app.get("/beats/:id", async (req, res) => {
 });
 
 // Create new beat (admin only)
-app.post("/beats", checkAdmin, upload.fields([{ name: "file" }, { name: "cover" }]), async (req, res) => {
+app.post("/beats", authenticateToken, upload.fields([{ name: "file" }, { name: "cover" }]), async (req, res) => {
   try {
     if (!req.files?.file?.[0]) {
       return res.status(400).json({ message: "Audio file is required" });
@@ -174,7 +233,7 @@ app.post("/beats", checkAdmin, upload.fields([{ name: "file" }, { name: "cover" 
 });
 
 // Update beat (admin only)
-app.put("/beats/:id", checkAdmin, async (req, res) => {
+app.put("/beats/:id", authenticateToken, async (req, res) => {
   try {
     const beat = await Beat.findByIdAndUpdate(
       req.params.id,
@@ -200,7 +259,7 @@ app.put("/beats/:id", checkAdmin, async (req, res) => {
 });
 
 // Delete beat (admin only)
-app.delete("/beats/:id", checkAdmin, async (req, res) => {
+app.delete("/beats/:id", authenticateToken, async (req, res) => {
   try {
     const beat = await Beat.findByIdAndDelete(req.params.id);
 
