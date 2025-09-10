@@ -136,18 +136,20 @@ const upload = multer({
 
 // Middleware to add base URL to beats
 function addBaseUrlToBeats(beats) {
-  if (Array.isArray(beats)) {
-    return beats.map(beat => ({
-      ...beat._doc || beat,
-      fileUrl: beat.fileUrl ? `${BASE_URL}${beat.fileUrl}` : null,
-      coverUrl: beat.coverUrl ? `${BASE_URL}${beat.coverUrl}` : null
-    }));
-  } else if (beats) {
+  const convertBeat = (beat) => {
+    // If beat is a Mongoose object, convert to plain object
+    const plainBeat = beat.toObject ? beat.toObject() : beat;
     return {
-      ...beats._doc || beats,
-      fileUrl: beats.fileUrl ? `${BASE_URL}${beats.fileUrl}` : null,
-      coverUrl: beats.coverUrl ? `${BASE_URL}${beat.coverUrl}` : null
+      ...plainBeat,
+      fileUrl: plainBeat.fileUrl ? `${BASE_URL}${plainBeat.fileUrl}` : null,
+      coverUrl: plainBeat.coverUrl ? `${BASE_URL}${plainBeat.coverUrl}` : null
     };
+  };
+
+  if (Array.isArray(beats)) {
+    return beats.map(convertBeat);
+  } else if (beats) {
+    return convertBeat(beats);
   }
   return beats;
 }
@@ -234,9 +236,13 @@ app.get("/beats/:id", async (req, res) => {
 // Create new beat (admin only)
 app.post("/beats", authenticateToken, upload.fields([{ name: "file" }, { name: "cover" }]), async (req, res) => {
   try {
+    console.log("Files received:", req.files);
+    console.log("Body received:", req.body);
+
     if (!req.files?.file?.[0]) {
       return res.status(400).json({ message: "Audio file is required" });
     }
+
     const fileName = req.files.file[0].filename;
     const coverName = req.files?.cover?.[0]?.filename;
 
@@ -251,10 +257,16 @@ app.post("/beats", authenticateToken, upload.fields([{ name: "file" }, { name: "
     });
 
     await beat.save();
-    res.status(201).json(addBaseUrlToBeats(beat));
+    console.log("Beat saved successfully:", beat);
+
+    // Convert Mongoose object to plain JS object
+    const beatObject = beat.toObject();
+    const responseBeat = addBaseUrlToBeats(beatObject);
+
+    res.status(201).json(responseBeat);
   } catch (e) {
     console.error("Error creating beat:", e);
-    res.status(500).json({ message: "Failed to save beat" });
+    res.status(500).json({ message: "Failed to save beat", error: e.message });
   }
 });
 
