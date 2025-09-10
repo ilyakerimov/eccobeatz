@@ -106,7 +106,33 @@ const storage = multer.diskStorage({
   filename: (req, file, cb) =>
     cb(null, Date.now() + "-" + Math.round(Math.random() * 1e9) + path.extname(file.originalname)),
 });
-const upload = multer({ storage });
+
+const upload = multer({
+  storage,
+  fileFilter: (req, file, cb) => {
+    // Check file types
+    if (file.fieldname === 'file') {
+      // Audio files
+      if (file.mimetype.startsWith('audio/')) {
+        cb(null, true);
+      } else {
+        cb(new Error('Only audio files are allowed for the audio field'), false);
+      }
+    } else if (file.fieldname === 'cover') {
+      // Image files
+      if (file.mimetype.startsWith('image/')) {
+        cb(null, true);
+      } else {
+        cb(new Error('Only image files are allowed for the cover field'), false);
+      }
+    } else {
+      cb(new Error('Unexpected field'), false);
+    }
+  },
+  limits: {
+    fileSize: 50 * 1024 * 1024, // 50MB limit
+  }
+});
 
 // Middleware to add base URL to beats
 function addBaseUrlToBeats(beats) {
@@ -120,7 +146,7 @@ function addBaseUrlToBeats(beats) {
     return {
       ...beats._doc || beats,
       fileUrl: beats.fileUrl ? `${BASE_URL}${beats.fileUrl}` : null,
-      coverUrl: beats.coverUrl ? `${BASE_URL}${beats.coverUrl}` : null
+      coverUrl: beats.coverUrl ? `${BASE_URL}${beat.coverUrl}` : null
     };
   }
   return beats;
@@ -225,7 +251,7 @@ app.post("/beats", authenticateToken, upload.fields([{ name: "file" }, { name: "
     });
 
     await beat.save();
-    res.json(addBaseUrlToBeats(beat));
+    res.status(201).json(addBaseUrlToBeats(beat));
   } catch (e) {
     console.error("Error creating beat:", e);
     res.status(500).json({ message: "Failed to save beat" });
@@ -326,6 +352,16 @@ app.get("/genres", async (req, res) => {
     console.error("Error fetching genres:", e);
     res.status(500).json({ message: "Failed to fetch genres" });
   }
+});
+
+// Error handling middleware
+app.use((error, req, res, next) => {
+  if (error instanceof multer.MulterError) {
+    if (error.code === 'LIMIT_FILE_SIZE') {
+      return res.status(400).json({ message: 'File too large' });
+    }
+  }
+  res.status(500).json({ message: error.message });
 });
 
 // Start server
