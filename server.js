@@ -8,6 +8,7 @@ import { fileURLToPath } from "url";
 import dotenv from "dotenv";
 import jwt from "jsonwebtoken";
 import bcrypt from "bcryptjs";
+import sharp from "sharp";
 
 dotenv.config();
 
@@ -47,6 +48,8 @@ app.use("/uploads", express.static(uploadsDir, {
   setHeaders: (res, path) => {
     if (path.endsWith('.mp3')) {
       res.setHeader('Content-Type', 'audio/mpeg');
+    } else if (path.endsWith('.webp')) {
+      res.setHeader('Content-Type', 'image/webp');
     }
   }
 }));
@@ -244,7 +247,34 @@ app.post("/beats", authenticateToken, upload.fields([{ name: "file" }, { name: "
     }
 
     const fileName = req.files.file[0].filename;
-    const coverName = req.files?.cover?.[0]?.filename;
+    let coverName = null;
+
+    // Process cover image if exists
+    if (req.files?.cover?.[0]) {
+      const coverFile = req.files.cover[0];
+      const originalCoverPath = coverFile.path;
+
+      // Create new filename with .webp extension
+      const newCoverName = path.parse(coverFile.filename).name + '.webp';
+      const newCoverPath = path.join(uploadsDir, newCoverName);
+
+      try {
+        // Convert image to WebP
+        await sharp(originalCoverPath)
+          .webp({ quality: 80 }) // 80% quality
+          .toFile(newCoverPath);
+
+        // Delete original file
+        fs.unlinkSync(originalCoverPath);
+
+        coverName = newCoverName;
+        console.log("Cover converted to WebP:", coverName);
+      } catch (convertError) {
+        console.error("Error converting cover to WebP:", convertError);
+        // In case of error, keep the original file
+        coverName = coverFile.filename;
+      }
+    }
 
     const beat = new Beat({
       title: req.body.title,
