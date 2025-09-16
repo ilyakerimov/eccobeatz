@@ -9,6 +9,8 @@ import dotenv from "dotenv";
 import jwt from "jsonwebtoken";
 import bcrypt from "bcryptjs";
 import sharp from "sharp";
+import rateLimit from "express-rate-limit";
+import helmet from "helmet";
 
 dotenv.config();
 
@@ -22,18 +24,47 @@ const BASE_URL = process.env.BASE_URL || `http://localhost:${PORT}`;
 
 const app = express();
 
+// Security middleware
+app.use(helmet({
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      scriptSrc: ["'self'", "'unsafe-inline'"],
+      styleSrc: ["'self'", "'unsafe-inline'"],
+      imgSrc: ["'self'", "data:", "blob:"],
+      mediaSrc: ["'self'", "data:", "blob:"],
+    },
+  },
+  crossOriginResourcePolicy: { policy: "cross-origin" }
+}));
+
 // Enhanced CORS configuration
 app.use(cors({
-  origin: "*",
+  origin: process.env.NODE_ENV === 'production' ? process.env.FRONTEND_URL : "*",
   methods: ["GET", "POST", "PUT", "DELETE"],
   credentials: false
 }));
 
-app.use(express.json());
+app.use(express.json({ limit: '10mb' }));
+
+// Rate limiting
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100 // limit each IP to 100 requests per windowMs
+});
+app.use(limiter);
+
+// stricter limiting for auth endpoints
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 5,
+  message: 'Too many login attempts, please try again later.'
+});
+app.use("/admin/login", authLimiter);
 
 // Logging middleware
 app.use((req, res, next) => {
-  console.log(`${new Date().toISOString()} - ${req.method} ${req.path}`);
+  console.log(`${new Date().toISOString()} - ${req.method} ${req.path} - ${req.ip}`);
   next();
 });
 
@@ -65,23 +96,28 @@ mongoose.connect(MONGO_URI, {
   process.exit(1);
 });
 
+// Helper function to validate MongoDB ObjectId
+const isValidObjectId = (id) => {
+  return mongoose.Types.ObjectId.isValid(id);
+};
+
 // Models
 const Beat = mongoose.model("Beat", {
-  title: String,
-  genre: String,
-  likes: { type: Number, default: 0 },
-  plays: { type: Number, default: 0 },
-  fileUrl: String,
+  title: { type: String, required: true, maxlength: 100 },
+  genre: { type: String, required: true, maxlength: 50 },
+  likes: { type: Number, default: 0, min: 0 },
+  plays: { type: Number, default: 0, min: 0 },
+  fileUrl: { type: String, required: true },
   coverUrl: String,
   date: { type: Date, default: Date.now },
-  price: { type: Number, default: 100 },
+  price: { type: Number, default: 100, min: 0, max: 10000 },
   featured: { type: Boolean, default: false },
-  description: String
+  description: { type: String, maxlength: 500 }
 });
 
 const Admin = mongoose.model("Admin", {
-  username: { type: String, required: true, unique: true },
-  password: { type: String, required: true }
+  username: { type: String, required: true, unique: true, minlength: 3, maxlength: 30 },
+  password: { type: String, required: true, minlength: 6 }
 });
 
 // Create default admin if not exists
@@ -89,7 +125,7 @@ async function createDefaultAdmin() {
   try {
     const adminExists = await Admin.findOne({ username: "admin" });
     if (!adminExists) {
-      const hashedPassword = await bcrypt.hash("admin123", 10);
+      const hashedPassword = await bcrypt.hash("admin123", 12);
       const admin = new Admin({
         username: "admin",
         password: hashedPassword
@@ -157,6 +193,29 @@ function addBaseUrlToBeats(beats) {
   return beats;
 }
 
+// Input validation middleware
+const validateBeatInput = (req, res, next) => {
+  const { title, genre, price, description } = req.body;
+
+  if (!title || title.trim().length === 0) {
+    return res.status(400).json({ message: "Title is required" });
+  }
+
+  if (!genre || genre.trim().length === 0) {
+    return res.status(400).json({ message: "Genre is required" });
+  }
+
+  if (price && (isNaN(price) || price < 0 || price > 10000)) {
+    return res.status(400).json({ message: "Price must be a number between 0 and 10000" });
+  }
+
+  if (description && description.length > 500) {
+    return res.status(400).json({ message: "Description too long" });
+  }
+
+  next();
+};
+
 // JWT authentication middleware
 function authenticateToken(req, res, next) {
   const authHeader = req.headers["authorization"];
@@ -185,8 +244,14 @@ app.post("/admin/login", async (req, res) => {
   try {
     const { username, password } = req.body;
 
+    // Basic validation
+    if (!username || !password) {
+      return res.status(400).json({ message: "Username and password are required" });
+    }
+
     const admin = await Admin.findOne({ username });
     if (!admin) {
+      // Use generic message to prevent username enumeration
       return res.status(401).json({ message: "Invalid credentials" });
     }
 
@@ -211,7 +276,7 @@ app.get("/beats", async (req, res) => {
     let filter = {};
 
     if (genre && genre !== "all") {
-      filter.genre = genre;
+      filter.genre = new RegExp(`^${genre}$`, 'i');
     }
 
     const beats = await Beat.find(filter).sort({ date: -1 });
@@ -225,6 +290,10 @@ app.get("/beats", async (req, res) => {
 // Get single beat by ID
 app.get("/beats/:id", async (req, res) => {
   try {
+    if (!isValidObjectId(req.params.id)) {
+      return res.status(400).json({ message: "Invalid beat ID" });
+    }
+
     const beat = await Beat.findById(req.params.id);
     if (!beat) {
       return res.status(404).json({ message: "Beat not found" });
@@ -237,7 +306,7 @@ app.get("/beats/:id", async (req, res) => {
 });
 
 // Create new beat (admin only)
-app.post("/beats", authenticateToken, upload.fields([{ name: "file" }, { name: "cover" }]), async (req, res) => {
+app.post("/beats", authenticateToken, upload.fields([{ name: "file" }, { name: "cover" }]), validateBeatInput, async (req, res) => {
   try {
     console.log("Files received:", req.files);
     console.log("Body received:", req.body);
@@ -301,8 +370,12 @@ app.post("/beats", authenticateToken, upload.fields([{ name: "file" }, { name: "
 });
 
 // Update beat (admin only)
-app.put("/beats/:id", authenticateToken, async (req, res) => {
+app.put("/beats/:id", authenticateToken, validateBeatInput, async (req, res) => {
   try {
+    if (!isValidObjectId(req.params.id)) {
+      return res.status(400).json({ message: "Invalid beat ID" });
+    }
+
     const beat = await Beat.findByIdAndUpdate(
       req.params.id,
       {
@@ -312,7 +385,7 @@ app.put("/beats/:id", authenticateToken, async (req, res) => {
         featured: req.body.featured,
         description: req.body.description
       },
-      { new: true }
+      { new: true, runValidators: true }
     );
 
     if (!beat) {
@@ -329,6 +402,10 @@ app.put("/beats/:id", authenticateToken, async (req, res) => {
 // Delete beat (admin only)
 app.delete("/beats/:id", authenticateToken, async (req, res) => {
   try {
+    if (!isValidObjectId(req.params.id)) {
+      return res.status(400).json({ message: "Invalid beat ID" });
+    }
+
     const beat = await Beat.findByIdAndDelete(req.params.id);
 
     if (!beat) {
@@ -360,6 +437,10 @@ app.delete("/beats/:id", authenticateToken, async (req, res) => {
 // Like beat
 app.post("/likes/:id", async (req, res) => {
   try {
+    if (!isValidObjectId(req.params.id)) {
+      return res.status(400).json({ message: "Invalid beat ID" });
+    }
+
     const beat = await Beat.findById(req.params.id);
     if (!beat) return res.status(404).json({ message: "Beat not found" });
     beat.likes++;
@@ -374,6 +455,10 @@ app.post("/likes/:id", async (req, res) => {
 // Increment play count
 app.post("/plays/:id", async (req, res) => {
   try {
+    if (!isValidObjectId(req.params.id)) {
+      return res.status(400).json({ message: "Invalid beat ID" });
+    }
+
     const beat = await Beat.findById(req.params.id);
     if (!beat) return res.status(404).json({ message: "Beat not found" });
     beat.plays++;
@@ -403,7 +488,18 @@ app.use((error, req, res, next) => {
       return res.status(400).json({ message: 'File too large' });
     }
   }
+
+  // Don't expose error details in production
+  if (process.env.NODE_ENV === 'production') {
+    return res.status(500).json({ message: 'Something went wrong' });
+  }
+
   res.status(500).json({ message: error.message });
+});
+
+// 404 handler
+app.use((req, res) => {
+  res.status(404).json({ message: "Endpoint not found" });
 });
 
 // Start server
