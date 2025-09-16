@@ -14,6 +14,7 @@ import helmet from "helmet";
 import mongoSanitize from 'express-mongo-sanitize';
 import hpp from "hpp";
 import validator from "validator";
+import crypto from "crypto";
 
 dotenv.config();
 
@@ -56,12 +57,16 @@ app.use(helmet({
   crossOriginEmbedderPolicy: false
 }));
 
-// Enhanced CORS configuration
+// Enhanced CORS configuration - разрешаем все origins
 app.use(cors({
-  origin: process.env.FRONTEND_URL || "http://localhost:3000",
-  methods: ["GET", "POST", "PUT", "DELETE"],
-  credentials: true
+  origin: true, // Разрешаем все origins
+  credentials: true,
+  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"]
 }));
+
+// Handle preflight requests
+app.options('*', cors());
 
 // Body parsing middleware with limits
 app.use(express.json({ limit: '10kb' }));
@@ -81,7 +86,7 @@ app.use(hpp());
 
 // Logging middleware
 app.use((req, res, next) => {
-  console.log(`${new Date().toISOString()} - ${req.method} ${req.path} - ${req.ip}`);
+  console.log(`${new Date().toISOString()} - ${req.method} ${req.path} - Origin: ${req.headers.origin}`);
   next();
 });
 
@@ -102,7 +107,7 @@ app.use("/uploads", express.static(uploadsDir, {
   }
 }));
 
-// MongoDB connection - удаляем устаревшие опции
+// MongoDB connection
 mongoose.connect(MONGO_URI)
 .then(() => console.log("MongoDB connected"))
 .catch((e) => {
@@ -185,14 +190,8 @@ const validateLoginInput = (data) => {
     errors.push('Invalid username format');
   }
 
-  if (!validator.isStrongPassword(data.password || '', {
-    minLength: 8,
-    minLowercase: 1,
-    minUppercase: 1,
-    minNumbers: 1,
-    minSymbols: 1
-  })) {
-    errors.push('Password does not meet security requirements');
+  if (!validator.isLength(data.password || '', { min: 8 })) {
+    errors.push('Password must be at least 8 characters');
   }
 
   return errors;
@@ -212,7 +211,7 @@ async function createDefaultAdmin() {
       console.log("Default admin created with provided password");
     } else if (!adminExists) {
       // Generate a random password if none provided
-      const randomPassword = require('crypto').randomBytes(16).toString('hex');
+      const randomPassword = crypto.randomBytes(16).toString('hex');
       const hashedPassword = await bcrypt.hash(randomPassword, 12);
       const admin = new Admin({
         username: "admin",
@@ -309,7 +308,8 @@ app.get("/health", (req, res) => {
   res.status(200).json({
     status: "OK",
     message: "Server is running",
-    timestamp: new Date().toISOString()
+    timestamp: new Date().toISOString(),
+    environment: NODE_ENV
   });
 });
 
@@ -323,11 +323,12 @@ app.post("/admin/login", async (req, res) => {
 
     const { username, password } = req.body;
 
-    const fakeHash = await bcrypt.hash('dummy', 12);
+    // Always hash a dummy password to prevent timing attacks
+    const dummyHash = await bcrypt.hash('dummy', 12);
 
     const admin = await Admin.findOne({ username });
     if (!admin) {
-      await bcrypt.compare('dummy', fakeHash);
+      await bcrypt.compare('dummy', dummyHash); // Consistent timing
       return res.status(401).json({ message: "Invalid credentials" });
     }
 
@@ -350,17 +351,8 @@ app.post("/admin/login", async (req, res) => {
       }
     );
 
-    if (NODE_ENV === 'production') {
-      res.cookie('token', token, {
-        httpOnly: true,
-        secure: true,
-        sameSite: 'strict',
-        maxAge: 60 * 60 * 1000
-      });
-    }
-
     res.json({
-      token: NODE_ENV === 'production' ? undefined : token,
+      token: token,
       username: admin.username,
       expiresIn: 3600
     });
@@ -372,13 +364,6 @@ app.post("/admin/login", async (req, res) => {
 
 // Logout endpoint
 app.post("/admin/logout", (req, res) => {
-  if (NODE_ENV === 'production') {
-    res.clearCookie('token', {
-      httpOnly: true,
-      secure: true,
-      sameSite: 'strict'
-    });
-  }
   res.json({ message: "Logged out successfully" });
 });
 
@@ -679,5 +664,6 @@ app.use((error, req, res, next) => {
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`Server running on port ${PORT}`);
   console.log(`Environment: ${NODE_ENV}`);
+  console.log(`Base URL: ${BASE_URL}`);
   console.log(`Health check: http://0.0.0.0:${PORT}/health`);
 });
