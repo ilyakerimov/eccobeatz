@@ -71,7 +71,7 @@ const limiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: NODE_ENV === 'production' ? 100 : 1000,
   message: "Too many requests from this IP, please try again later.",
-  validate: { trustProxy: true } // Add this option
+  validate: { trustProxy: true }
 });
 app.use(limiter);
 
@@ -102,18 +102,15 @@ app.use("/uploads", express.static(uploadsDir, {
   }
 }));
 
-// MongoDB connection
-mongoose.connect(MONGO_URI, {
-  useNewUrlParser: true,
-  useUnifiedTopology: true,
-})
+// MongoDB connection - удаляем устаревшие опции
+mongoose.connect(MONGO_URI)
 .then(() => console.log("MongoDB connected"))
 .catch((e) => {
   console.error("MongoDB connection error:", e);
   process.exit(1);
 });
 
-// Models (остаются без изменений)
+// Models
 const Beat = mongoose.model("Beat", {
   title: { type: String, required: true, maxlength: 100 },
   genre: { type: String, required: true, maxlength: 50 },
@@ -242,9 +239,7 @@ const storage = multer.diskStorage({
 });
 
 const fileFilter = (req, file, cb) => {
-  // Check file types
   if (file.fieldname === 'file') {
-    // Audio files
     const audioMimes = ['audio/mpeg', 'audio/wav', 'audio/x-wav', 'audio/mp3'];
     if (audioMimes.includes(file.mimetype)) {
       cb(null, true);
@@ -252,7 +247,6 @@ const fileFilter = (req, file, cb) => {
       cb(new Error('Only audio files (MP3, WAV) are allowed'), false);
     }
   } else if (file.fieldname === 'cover') {
-    // Image files
     const imageMimes = ['image/jpeg', 'image/png', 'image/webp', 'image/gif'];
     if (imageMimes.includes(file.mimetype)) {
       cb(null, true);
@@ -268,15 +262,14 @@ const upload = multer({
   storage,
   fileFilter,
   limits: {
-    fileSize: 20 * 1024 * 1024, // 20MB limit
-    files: 2 // Maximum 2 files per request
+    fileSize: 20 * 1024 * 1024,
+    files: 2
   }
 });
 
 // Middleware to add base URL to beats
 function addBaseUrlToBeats(beats) {
   const convertBeat = (beat) => {
-    // If beat is a Mongoose object, convert to plain object
     const plainBeat = beat.toObject ? beat.toObject() : beat;
     return {
       ...plainBeat,
@@ -323,7 +316,6 @@ app.get("/health", (req, res) => {
 // Admin login endpoint
 app.post("/admin/login", async (req, res) => {
   try {
-    // Input validation
     const validationErrors = validateLoginInput(req.body);
     if (validationErrors.length > 0) {
       return res.status(400).json({ message: validationErrors.join(', ') });
@@ -331,12 +323,11 @@ app.post("/admin/login", async (req, res) => {
 
     const { username, password } = req.body;
 
-    // Prevent timing attacks by always hashing
     const fakeHash = await bcrypt.hash('dummy', 12);
 
     const admin = await Admin.findOne({ username });
     if (!admin) {
-      await bcrypt.compare('dummy', fakeHash); // Constant time comparison
+      await bcrypt.compare('dummy', fakeHash);
       return res.status(401).json({ message: "Invalid credentials" });
     }
 
@@ -359,13 +350,12 @@ app.post("/admin/login", async (req, res) => {
       }
     );
 
-    // Set secure cookie in production
     if (NODE_ENV === 'production') {
       res.cookie('token', token, {
         httpOnly: true,
         secure: true,
         sameSite: 'strict',
-        maxAge: 60 * 60 * 1000 // 1 hour
+        maxAge: 60 * 60 * 1000
       });
     }
 
@@ -397,7 +387,6 @@ app.get("/beats", async (req, res) => {
   try {
     const { genre, limit = 50, page = 1 } = req.query;
 
-    // Validate inputs
     const validatedLimit = Math.min(parseInt(limit) || 50, 100);
     const validatedPage = Math.max(parseInt(page) || 1, 1);
 
@@ -455,10 +444,8 @@ app.get("/beats/:id", async (req, res) => {
 // Create new beat (admin only)
 app.post("/beats", authenticateToken, upload.fields([{ name: "file" }, { name: "cover" }]), async (req, res) => {
   try {
-    // Input validation
     const validationErrors = validateBeatInput(req.body);
     if (validationErrors.length > 0) {
-      // Clean up uploaded files if validation fails
       if (req.files) {
         Object.values(req.files).forEach(files => {
           files.forEach(file => {
@@ -476,40 +463,33 @@ app.post("/beats", authenticateToken, upload.fields([{ name: "file" }, { name: "
     const fileName = req.files.file[0].filename;
     let coverName = null;
 
-    // Process cover image if exists
     if (req.files?.cover?.[0]) {
       const coverFile = req.files.cover[0];
       const originalCoverPath = coverFile.path;
 
-      // Create new filename with .webp extension
       const newCoverName = 'cover-' + Date.now() + '.webp';
       const newCoverPath = path.join(uploadsDir, newCoverName);
 
       try {
-        // Convert image to WebP with security checks
         const image = sharp(originalCoverPath);
         const metadata = await image.metadata();
 
-        // Validate image dimensions
         if (metadata.width > 5000 || metadata.height > 5000) {
           throw new Error('Image dimensions too large');
         }
 
         await image
-          .resize(800, 800, { // Limit size
+          .resize(800, 800, {
             fit: 'inside',
             withoutEnlargement: true
           })
           .webp({ quality: 80 })
           .toFile(newCoverPath);
 
-        // Delete original file
         fs.unlinkSync(originalCoverPath);
-
         coverName = newCoverName;
       } catch (convertError) {
         console.error("Error converting cover to WebP:", convertError);
-        // Clean up on error
         fs.unlinkSync(originalCoverPath);
         return res.status(400).json({ message: "Invalid image file" });
       }
@@ -527,7 +507,6 @@ app.post("/beats", authenticateToken, upload.fields([{ name: "file" }, { name: "
 
     await beat.save();
 
-    // Convert Mongoose object to plain JS object
     const beatObject = beat.toObject();
     const responseBeat = addBaseUrlToBeats(beatObject);
 
@@ -535,7 +514,6 @@ app.post("/beats", authenticateToken, upload.fields([{ name: "file" }, { name: "
   } catch (e) {
     console.error("Error creating beat:", e);
 
-    // Clean up uploaded files on error
     if (req.files) {
       Object.values(req.files).forEach(files => {
         files.forEach(file => {
@@ -555,7 +533,6 @@ app.put("/beats/:id", authenticateToken, async (req, res) => {
       return res.status(400).json({ message: "Invalid beat ID" });
     }
 
-    // Input validation
     const validationErrors = validateBeatInput(req.body);
     if (validationErrors.length > 0) {
       return res.status(400).json({ message: validationErrors.join(', ') });
@@ -597,7 +574,6 @@ app.delete("/beats/:id", authenticateToken, async (req, res) => {
       return res.status(404).json({ message: "Beat not found" });
     }
 
-    // Delete associated files
     const deleteFile = (filePath) => {
       if (filePath) {
         const fullPath = path.join(__dirname, filePath);
@@ -619,8 +595,8 @@ app.delete("/beats/:id", authenticateToken, async (req, res) => {
 
 // Like beat - with rate limiting
 const likeLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 10, // limit each IP to 10 likes per windowMs
+  windowMs: 15 * 60 * 1000,
+  max: 10,
   message: "Too many likes from this IP, please try again later."
 });
 app.post("/likes/:id", likeLimiter, async (req, res) => {
@@ -642,8 +618,8 @@ app.post("/likes/:id", likeLimiter, async (req, res) => {
 
 // Increment play count - with rate limiting
 const playLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 50, // limit each IP to 50 plays per windowMs
+  windowMs: 15 * 60 * 1000,
+  max: 50,
   message: "Too many plays from this IP, please try again later."
 });
 app.post("/plays/:id", playLimiter, async (req, res) => {
@@ -692,7 +668,6 @@ app.use((error, req, res, next) => {
     }
   }
 
-  // Don't leak error details in production
   const message = NODE_ENV === 'production'
     ? 'Something went wrong'
     : error.message;
