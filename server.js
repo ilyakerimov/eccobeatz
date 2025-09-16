@@ -11,7 +11,7 @@ import bcrypt from "bcryptjs";
 import sharp from "sharp";
 import rateLimit from "express-rate-limit";
 import helmet from "helmet";
-import mongoSanitize from "express-mongo-sanitize";
+import mongoSanitize from 'express-mongo-sanitize';
 import hpp from "hpp";
 import validator from "validator";
 
