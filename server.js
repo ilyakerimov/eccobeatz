@@ -125,16 +125,26 @@ async function createDefaultAdmin() {
   try {
     const adminExists = await Admin.findOne({ username: "admin" });
     if (!adminExists) {
-      const hashedPassword = await bcrypt.hash("admin123", 12);
+      const hashedPassword = await bcrypt.hash(DEFAULT_ADMIN_PASSWORD, 12); // Используем переменную окружения
       const admin = new Admin({
         username: "admin",
         password: hashedPassword
       });
       await admin.save();
-      console.log("Default admin created: admin / admin123");
+      console.log(`Default admin created: admin / ${DEFAULT_ADMIN_PASSWORD}`);
+    } else {
+      // Обновляем пароль существующего администратора, если он не соответствует
+      const admin = await Admin.findOne({ username: "admin" });
+      const isPasswordCorrect = await bcrypt.compare(DEFAULT_ADMIN_PASSWORD, admin.password);
+      if (!isPasswordCorrect) {
+        const hashedPassword = await bcrypt.hash(DEFAULT_ADMIN_PASSWORD, 12);
+        admin.password = hashedPassword;
+        await admin.save();
+        console.log(`Admin password updated to: ${DEFAULT_ADMIN_PASSWORD}`);
+      }
     }
   } catch (error) {
-    console.error("Error creating default admin:", error);
+    console.error("Error creating/updating default admin:", error);
   }
 }
 createDefaultAdmin();
