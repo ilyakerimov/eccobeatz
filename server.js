@@ -39,6 +39,9 @@ const NODE_ENV = process.env.NODE_ENV || "development";
 
 const app = express();
 
+// Trust proxy for rate limiting behind reverse proxy
+app.set('trust proxy', 1);
+
 // Security middleware
 app.use(helmet({
   contentSecurityPolicy: {
@@ -57,23 +60,24 @@ app.use(helmet({
 app.use(cors({
   origin: process.env.FRONTEND_URL || "http://localhost:3000",
   methods: ["GET", "POST", "PUT", "DELETE"],
-  credentials: false
+  credentials: true
 }));
+
+// Body parsing middleware with limits
+app.use(express.json({ limit: '10kb' }));
 
 // Rate limiting
 const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: NODE_ENV === 'production' ? 100 : 1000, // limit each IP to 100 requests per windowMs in production
-  message: "Too many requests from this IP, please try again later."
+  windowMs: 15 * 60 * 1000,
+  max: NODE_ENV === 'production' ? 100 : 1000,
+  message: "Too many requests from this IP, please try again later.",
+  validate: { trustProxy: true } // Add this option
 });
 app.use(limiter);
 
 // Additional security middleware
-app.use(mongoSanitize()); // Prevent NoSQL injection
-app.use(hpp()); // Prevent parameter pollution
-
-// Body parsing middleware with limits
-app.use(express.json({ limit: '10kb' }));
+app.use(mongoSanitize());
+app.use(hpp());
 
 // Logging middleware
 app.use((req, res, next) => {
@@ -87,25 +91,18 @@ if (!fs.existsSync(uploadsDir)) {
   fs.mkdirSync(uploadsDir, { recursive: true });
 }
 
-// Static file serving with proper headers - ONLY IN DEVELOPMENT
-if (NODE_ENV === 'development') {
-  app.use("/uploads", express.static(uploadsDir, {
-    setHeaders: (res, path) => {
-      if (path.endsWith('.mp3')) {
-        res.setHeader('Content-Type', 'audio/mpeg');
-      } else if (path.endsWith('.webp')) {
-        res.setHeader('Content-Type', 'image/webp');
-      }
+// Static file serving
+app.use("/uploads", express.static(uploadsDir, {
+  setHeaders: (res, path) => {
+    if (path.endsWith('.mp3')) {
+      res.setHeader('Content-Type', 'audio/mpeg');
+    } else if (path.endsWith('.webp')) {
+      res.setHeader('Content-Type', 'image/webp');
     }
-  }));
-} else {
-  // In production, serve static files through CDN/separate server
-  app.use("/uploads", (req, res) => {
-    res.status(403).json({ message: "Direct file access not allowed in production" });
-  });
-}
+  }
+}));
 
-// MongoDB connection with improved options
+// MongoDB connection
 mongoose.connect(MONGO_URI, {
   useNewUrlParser: true,
   useUnifiedTopology: true,
@@ -116,7 +113,7 @@ mongoose.connect(MONGO_URI, {
   process.exit(1);
 });
 
-// Models
+// Models (остаются без изменений)
 const Beat = mongoose.model("Beat", {
   title: { type: String, required: true, maxlength: 100 },
   genre: { type: String, required: true, maxlength: 50 },
