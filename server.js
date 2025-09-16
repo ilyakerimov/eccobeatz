@@ -9,31 +9,75 @@ import dotenv from "dotenv";
 import jwt from "jsonwebtoken";
 import bcrypt from "bcryptjs";
 import sharp from "sharp";
+import rateLimit from "express-rate-limit";
+import helmet from "helmet";
+import mongoSanitize from "express-mongo-sanitize";
+import hpp from "hpp";
+import validator from "validator";
 
 dotenv.config();
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+// Validate essential environment variables
+if (!process.env.MONGO_URI) {
+  console.error("FATAL ERROR: MONGO_URI is not defined");
+  process.exit(1);
+}
+
+if (!process.env.JWT_SECRET || process.env.JWT_SECRET === "defaultJwtSecret") {
+  console.error("FATAL ERROR: JWT_SECRET is not properly configured");
+  process.exit(1);
+}
+
 const PORT = process.env.PORT || 4000;
-const MONGO_URI = process.env.MONGO_URI || "mongodb://127.0.0.1:27017/beats";
-const JWT_SECRET = process.env.JWT_SECRET || "defaultJwtSecret";
+const MONGO_URI = process.env.MONGO_URI;
+const JWT_SECRET = process.env.JWT_SECRET;
 const BASE_URL = process.env.BASE_URL || `http://localhost:${PORT}`;
+const NODE_ENV = process.env.NODE_ENV || "development";
 
 const app = express();
 
+// Security middleware
+app.use(helmet({
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      styleSrc: ["'self'", "'unsafe-inline'"],
+      scriptSrc: ["'self'"],
+      imgSrc: ["'self'", "data:", "https:"],
+      mediaSrc: ["'self'", "data:"]
+    }
+  },
+  crossOriginEmbedderPolicy: false
+}));
+
 // Enhanced CORS configuration
 app.use(cors({
-  origin: "*",
+  origin: process.env.FRONTEND_URL || "http://localhost:3000",
   methods: ["GET", "POST", "PUT", "DELETE"],
   credentials: false
 }));
 
-app.use(express.json());
+// Rate limiting
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: NODE_ENV === 'production' ? 100 : 1000, // limit each IP to 100 requests per windowMs in production
+  message: "Too many requests from this IP, please try again later."
+});
+app.use(limiter);
+
+// Additional security middleware
+app.use(mongoSanitize()); // Prevent NoSQL injection
+app.use(hpp()); // Prevent parameter pollution
+
+// Body parsing middleware with limits
+app.use(express.json({ limit: '10kb' }));
 
 // Logging middleware
 app.use((req, res, next) => {
-  console.log(`${new Date().toISOString()} - ${req.method} ${req.path}`);
+  console.log(`${new Date().toISOString()} - ${req.method} ${req.path} - ${req.ip}`);
   next();
 });
 
@@ -43,16 +87,23 @@ if (!fs.existsSync(uploadsDir)) {
   fs.mkdirSync(uploadsDir, { recursive: true });
 }
 
-// Static file serving with proper headers
-app.use("/uploads", express.static(uploadsDir, {
-  setHeaders: (res, path) => {
-    if (path.endsWith('.mp3')) {
-      res.setHeader('Content-Type', 'audio/mpeg');
-    } else if (path.endsWith('.webp')) {
-      res.setHeader('Content-Type', 'image/webp');
+// Static file serving with proper headers - ONLY IN DEVELOPMENT
+if (NODE_ENV === 'development') {
+  app.use("/uploads", express.static(uploadsDir, {
+    setHeaders: (res, path) => {
+      if (path.endsWith('.mp3')) {
+        res.setHeader('Content-Type', 'audio/mpeg');
+      } else if (path.endsWith('.webp')) {
+        res.setHeader('Content-Type', 'image/webp');
+      }
     }
-  }
-}));
+  }));
+} else {
+  // In production, serve static files through CDN/separate server
+  app.use("/uploads", (req, res) => {
+    res.status(403).json({ message: "Direct file access not allowed in production" });
+  });
+}
 
 // MongoDB connection with improved options
 mongoose.connect(MONGO_URI, {
@@ -67,35 +118,115 @@ mongoose.connect(MONGO_URI, {
 
 // Models
 const Beat = mongoose.model("Beat", {
-  title: String,
-  genre: String,
-  likes: { type: Number, default: 0 },
-  plays: { type: Number, default: 0 },
-  fileUrl: String,
+  title: { type: String, required: true, maxlength: 100 },
+  genre: { type: String, required: true, maxlength: 50 },
+  likes: { type: Number, default: 0, min: 0 },
+  plays: { type: Number, default: 0, min: 0 },
+  fileUrl: { type: String, required: true },
   coverUrl: String,
   date: { type: Date, default: Date.now },
-  price: { type: Number, default: 100 },
+  price: { type: Number, default: 100, min: 0, max: 10000 },
   featured: { type: Boolean, default: false },
-  description: String
+  description: { type: String, maxlength: 500 }
 });
 
 const Admin = mongoose.model("Admin", {
-  username: { type: String, required: true, unique: true },
-  password: { type: String, required: true }
+  username: {
+    type: String,
+    required: true,
+    unique: true,
+    validate: {
+      validator: function(v) {
+        return validator.isAlphanumeric(v) && v.length >= 3 && v.length <= 30;
+      },
+      message: 'Username must be alphanumeric and between 3-30 characters'
+    }
+  },
+  password: {
+    type: String,
+    required: true,
+    validate: {
+      validator: function(v) {
+        return validator.isStrongPassword(v, {
+          minLength: 8,
+          minLowercase: 1,
+          minUppercase: 1,
+          minNumbers: 1,
+          minSymbols: 1
+        });
+      },
+      message: 'Password must be at least 8 characters with uppercase, lowercase, number and symbol'
+    }
+  }
 });
+
+// Input validation functions
+const validateBeatInput = (data) => {
+  const errors = [];
+
+  if (!validator.isLength(data.title || '', { min: 1, max: 100 })) {
+    errors.push('Title must be between 1-100 characters');
+  }
+
+  if (!validator.isLength(data.genre || '', { min: 1, max: 50 })) {
+    errors.push('Genre must be between 1-50 characters');
+  }
+
+  if (!validator.isInt(String(data.price || ''), { min: 0, max: 10000 })) {
+    errors.push('Price must be a number between 0-10000');
+  }
+
+  if (data.description && !validator.isLength(data.description, { max: 500 })) {
+    errors.push('Description must be less than 500 characters');
+  }
+
+  return errors;
+};
+
+const validateLoginInput = (data) => {
+  const errors = [];
+
+  if (!validator.isLength(data.username || '', { min: 3, max: 30 }) ||
+      !validator.isAlphanumeric(data.username || '')) {
+    errors.push('Invalid username format');
+  }
+
+  if (!validator.isStrongPassword(data.password || '', {
+    minLength: 8,
+    minLowercase: 1,
+    minUppercase: 1,
+    minNumbers: 1,
+    minSymbols: 1
+  })) {
+    errors.push('Password does not meet security requirements');
+  }
+
+  return errors;
+};
 
 // Create default admin if not exists
 async function createDefaultAdmin() {
   try {
     const adminExists = await Admin.findOne({ username: "admin" });
-    if (!adminExists) {
-      const hashedPassword = await bcrypt.hash("admin123", 10);
+    if (!adminExists && process.env.DEFAULT_ADMIN_PASSWORD) {
+      const hashedPassword = await bcrypt.hash(process.env.DEFAULT_ADMIN_PASSWORD, 12);
       const admin = new Admin({
         username: "admin",
         password: hashedPassword
       });
       await admin.save();
-      console.log("Default admin created: admin / admin123");
+      console.log("Default admin created with provided password");
+    } else if (!adminExists) {
+      // Generate a random password if none provided
+      const randomPassword = require('crypto').randomBytes(16).toString('hex');
+      const hashedPassword = await bcrypt.hash(randomPassword, 12);
+      const admin = new Admin({
+        username: "admin",
+        password: hashedPassword
+      });
+      await admin.save();
+      console.log("Default admin created with random password:", randomPassword);
+      console.log("PLEASE CHANGE THIS PASSWORD IMMEDIATELY!");
     }
   } catch (error) {
     console.error("Error creating default admin:", error);
@@ -103,37 +234,45 @@ async function createDefaultAdmin() {
 }
 createDefaultAdmin();
 
-// Multer configuration
+// Multer configuration with enhanced security
 const storage = multer.diskStorage({
   destination: (req, file, cb) => cb(null, uploadsDir),
-  filename: (req, file, cb) =>
-    cb(null, Date.now() + "-" + Math.round(Math.random() * 1e9) + path.extname(file.originalname)),
+  filename: (req, file, cb) => {
+    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1e9);
+    const ext = path.extname(file.originalname);
+    cb(null, 'file-' + uniqueSuffix + ext);
+  },
 });
+
+const fileFilter = (req, file, cb) => {
+  // Check file types
+  if (file.fieldname === 'file') {
+    // Audio files
+    const audioMimes = ['audio/mpeg', 'audio/wav', 'audio/x-wav', 'audio/mp3'];
+    if (audioMimes.includes(file.mimetype)) {
+      cb(null, true);
+    } else {
+      cb(new Error('Only audio files (MP3, WAV) are allowed'), false);
+    }
+  } else if (file.fieldname === 'cover') {
+    // Image files
+    const imageMimes = ['image/jpeg', 'image/png', 'image/webp', 'image/gif'];
+    if (imageMimes.includes(file.mimetype)) {
+      cb(null, true);
+    } else {
+      cb(new Error('Only image files (JPEG, PNG, WebP, GIF) are allowed'), false);
+    }
+  } else {
+    cb(new Error('Unexpected field'), false);
+  }
+};
 
 const upload = multer({
   storage,
-  fileFilter: (req, file, cb) => {
-    // Check file types
-    if (file.fieldname === 'file') {
-      // Audio files
-      if (file.mimetype.startsWith('audio/')) {
-        cb(null, true);
-      } else {
-        cb(new Error('Only audio files are allowed for the audio field'), false);
-      }
-    } else if (file.fieldname === 'cover') {
-      // Image files
-      if (file.mimetype.startsWith('image/')) {
-        cb(null, true);
-      } else {
-        cb(new Error('Only image files are allowed for the cover field'), false);
-      }
-    } else {
-      cb(new Error('Unexpected field'), false);
-    }
-  },
+  fileFilter,
   limits: {
-    fileSize: 50 * 1024 * 1024, // 50MB limit
+    fileSize: 20 * 1024 * 1024, // 20MB limit
+    files: 2 // Maximum 2 files per request
   }
 });
 
@@ -177,16 +316,30 @@ function authenticateToken(req, res, next) {
 
 // Health check endpoint
 app.get("/health", (req, res) => {
-  res.status(200).json({ status: "OK", message: "Server is running" });
+  res.status(200).json({
+    status: "OK",
+    message: "Server is running",
+    timestamp: new Date().toISOString()
+  });
 });
 
 // Admin login endpoint
 app.post("/admin/login", async (req, res) => {
   try {
+    // Input validation
+    const validationErrors = validateLoginInput(req.body);
+    if (validationErrors.length > 0) {
+      return res.status(400).json({ message: validationErrors.join(', ') });
+    }
+
     const { username, password } = req.body;
+
+    // Prevent timing attacks by always hashing
+    const fakeHash = await bcrypt.hash('dummy', 12);
 
     const admin = await Admin.findOne({ username });
     if (!admin) {
+      await bcrypt.compare('dummy', fakeHash); // Constant time comparison
       return res.status(401).json({ message: "Invalid credentials" });
     }
 
@@ -195,27 +348,89 @@ app.post("/admin/login", async (req, res) => {
       return res.status(401).json({ message: "Invalid credentials" });
     }
 
-    const token = jwt.sign({ userId: admin._id, username: admin.username }, JWT_SECRET, { expiresIn: "24h" });
+    const token = jwt.sign(
+      {
+        userId: admin._id,
+        username: admin.username,
+        type: 'admin'
+      },
+      JWT_SECRET,
+      {
+        expiresIn: "1h",
+        issuer: 'beat-server',
+        audience: 'beat-client'
+      }
+    );
 
-    res.json({ token, username: admin.username });
+    // Set secure cookie in production
+    if (NODE_ENV === 'production') {
+      res.cookie('token', token, {
+        httpOnly: true,
+        secure: true,
+        sameSite: 'strict',
+        maxAge: 60 * 60 * 1000 // 1 hour
+      });
+    }
+
+    res.json({
+      token: NODE_ENV === 'production' ? undefined : token,
+      username: admin.username,
+      expiresIn: 3600
+    });
   } catch (e) {
     console.error("Login error:", e);
     res.status(500).json({ message: "Login failed" });
   }
 });
 
+// Logout endpoint
+app.post("/admin/logout", (req, res) => {
+  if (NODE_ENV === 'production') {
+    res.clearCookie('token', {
+      httpOnly: true,
+      secure: true,
+      sameSite: 'strict'
+    });
+  }
+  res.json({ message: "Logged out successfully" });
+});
+
 // Get all beats with genre filter
 app.get("/beats", async (req, res) => {
   try {
-    const { genre } = req.query;
+    const { genre, limit = 50, page = 1 } = req.query;
+
+    // Validate inputs
+    const validatedLimit = Math.min(parseInt(limit) || 50, 100);
+    const validatedPage = Math.max(parseInt(page) || 1, 1);
+
     let filter = {};
 
     if (genre && genre !== "all") {
+      if (!validator.isLength(genre, { max: 50 })) {
+        return res.status(400).json({ message: "Invalid genre parameter" });
+      }
       filter.genre = genre;
     }
 
-    const beats = await Beat.find(filter).sort({ date: -1 });
-    res.json(addBaseUrlToBeats(beats));
+    const skip = (validatedPage - 1) * validatedLimit;
+
+    const beats = await Beat.find(filter)
+      .sort({ date: -1 })
+      .limit(validatedLimit)
+      .skip(skip);
+
+    const total = await Beat.countDocuments(filter);
+
+    res.json({
+      beats: addBaseUrlToBeats(beats),
+      pagination: {
+        page: validatedPage,
+        limit: validatedLimit,
+        total,
+        pages: Math.ceil(total / validatedLimit)
+      }
+    });
   } catch (e) {
     console.error("Error fetching beats:", e);
     res.status(500).json({ message: "Failed to fetch beats" });
@@ -225,6 +440,10 @@ app.get("/beats", async (req, res) => {
 // Get single beat by ID
 app.get("/beats/:id", async (req, res) => {
   try {
+    if (!validator.isMongoId(req.params.id)) {
+      return res.status(400).json({ message: "Invalid beat ID" });
+    }
+
     const beat = await Beat.findById(req.params.id);
     if (!beat) {
       return res.status(404).json({ message: "Beat not found" });
@@ -239,8 +458,19 @@ app.get("/beats/:id", async (req, res) => {
 // Create new beat (admin only)
 app.post("/beats", authenticateToken, upload.fields([{ name: "file" }, { name: "cover" }]), async (req, res) => {
   try {
-    console.log("Files received:", req.files);
-    console.log("Body received:", req.body);
+    // Input validation
+    const validationErrors = validateBeatInput(req.body);
+    if (validationErrors.length > 0) {
+      // Clean up uploaded files if validation fails
+      if (req.files) {
+        Object.values(req.files).forEach(files => {
+          files.forEach(file => {
+            fs.unlink(file.path, () => {});
+          });
+        });
+      }
+      return res.status(400).json({ message: validationErrors.join(', ') });
+    }
 
     if (!req.files?.file?.[0]) {
       return res.status(400).json({ message: "Audio file is required" });
@@ -255,39 +485,50 @@ app.post("/beats", authenticateToken, upload.fields([{ name: "file" }, { name: "
       const originalCoverPath = coverFile.path;
 
       // Create new filename with .webp extension
-      const newCoverName = path.parse(coverFile.filename).name + '.webp';
+      const newCoverName = 'cover-' + Date.now() + '.webp';
       const newCoverPath = path.join(uploadsDir, newCoverName);
 
       try {
-        // Convert image to WebP
-        await sharp(originalCoverPath)
-          .webp({ quality: 80 }) // 80% quality
+        // Convert image to WebP with security checks
+        const image = sharp(originalCoverPath);
+        const metadata = await image.metadata();
+
+        // Validate image dimensions
+        if (metadata.width > 5000 || metadata.height > 5000) {
+          throw new Error('Image dimensions too large');
+        }
+
+        await image
+          .resize(800, 800, { // Limit size
+            fit: 'inside',
+            withoutEnlargement: true
+          })
+          .webp({ quality: 80 })
           .toFile(newCoverPath);
 
         // Delete original file
         fs.unlinkSync(originalCoverPath);
 
         coverName = newCoverName;
-        console.log("Cover converted to WebP:", coverName);
       } catch (convertError) {
         console.error("Error converting cover to WebP:", convertError);
-        // In case of error, keep the original file
-        coverName = coverFile.filename;
+        // Clean up on error
+        fs.unlinkSync(originalCoverPath);
+        return res.status(400).json({ message: "Invalid image file" });
       }
     }
 
     const beat = new Beat({
-      title: req.body.title,
-      genre: req.body.genre,
-      price: req.body.price || 100,
-      featured: req.body.featured || false,
-      description: req.body.description,
+      title: validator.escape(req.body.title),
+      genre: validator.escape(req.body.genre),
+      price: parseInt(req.body.price) || 100,
+      featured: req.body.featured === 'true',
+      description: req.body.description ? validator.escape(req.body.description) : undefined,
       fileUrl: `/uploads/${fileName}`,
       coverUrl: coverName ? `/uploads/${coverName}` : undefined,
     });
 
     await beat.save();
-    console.log("Beat saved successfully:", beat);
 
     // Convert Mongoose object to plain JS object
     const beatObject = beat.toObject();
@@ -296,6 +537,16 @@ app.post("/beats", authenticateToken, upload.fields([{ name: "file" }, { name: "
     res.status(201).json(responseBeat);
   } catch (e) {
     console.error("Error creating beat:", e);
+
+    // Clean up uploaded files on error
+    if (req.files) {
+      Object.values(req.files).forEach(files => {
+        files.forEach(file => {
+          fs.unlink(file.path, () => {});
+        });
+      });
+    }
+
     res.status(500).json({ message: "Failed to save beat", error: e.message });
   }
 });
@@ -303,16 +554,26 @@ app.post("/beats", authenticateToken, upload.fields([{ name: "file" }, { name: "
 // Update beat (admin only)
 app.put("/beats/:id", authenticateToken, async (req, res) => {
   try {
+    if (!validator.isMongoId(req.params.id)) {
+      return res.status(400).json({ message: "Invalid beat ID" });
+    }
+
+    // Input validation
+    const validationErrors = validateBeatInput(req.body);
+    if (validationErrors.length > 0) {
+      return res.status(400).json({ message: validationErrors.join(', ') });
+    }
+
     const beat = await Beat.findByIdAndUpdate(
       req.params.id,
       {
-        title: req.body.title,
-        genre: req.body.genre,
-        price: req.body.price,
-        featured: req.body.featured,
-        description: req.body.description
+        title: validator.escape(req.body.title),
+        genre: validator.escape(req.body.genre),
+        price: parseInt(req.body.price),
+        featured: req.body.featured === 'true',
+        description: req.body.description ? validator.escape(req.body.description) : undefined
       },
-      { new: true }
+      { new: true, runValidators: true }
     );
 
     if (!beat) {
@@ -329,6 +590,10 @@ app.put("/beats/:id", authenticateToken, async (req, res) => {
 // Delete beat (admin only)
 app.delete("/beats/:id", authenticateToken, async (req, res) => {
   try {
+    if (!validator.isMongoId(req.params.id)) {
+      return res.status(400).json({ message: "Invalid beat ID" });
+    }
+
     const beat = await Beat.findByIdAndDelete(req.params.id);
 
     if (!beat) {
@@ -336,19 +601,17 @@ app.delete("/beats/:id", authenticateToken, async (req, res) => {
     }
 
     // Delete associated files
-    if (beat.fileUrl) {
-      const filePath = path.join(__dirname, beat.fileUrl);
-      if (fs.existsSync(filePath)) {
-        fs.unlinkSync(filePath);
+    const deleteFile = (filePath) => {
+      if (filePath) {
+        const fullPath = path.join(__dirname, filePath);
+        if (fs.existsSync(fullPath)) {
+          fs.unlinkSync(fullPath);
+        }
       }
-    }
+    };
 
-    if (beat.coverUrl) {
-      const coverPath = path.join(__dirname, beat.coverUrl);
-      if (fs.existsSync(coverPath)) {
-        fs.unlinkSync(coverPath);
-      }
-    }
+    deleteFile(beat.fileUrl);
+    deleteFile(beat.coverUrl);
 
     res.json({ message: "Beat deleted successfully" });
   } catch (e) {
@@ -357,9 +620,18 @@ app.delete("/beats/:id", authenticateToken, async (req, res) => {
   }
 });
 
-// Like beat
-app.post("/likes/:id", async (req, res) => {
+// Like beat - with rate limiting
+const likeLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 10, // limit each IP to 10 likes per windowMs
+  message: "Too many likes from this IP, please try again later."
+});
+app.post("/likes/:id", likeLimiter, async (req, res) => {
   try {
+    if (!validator.isMongoId(req.params.id)) {
+      return res.status(400).json({ message: "Invalid beat ID" });
+    }
+
     const beat = await Beat.findById(req.params.id);
     if (!beat) return res.status(404).json({ message: "Beat not found" });
     beat.likes++;
@@ -371,9 +643,18 @@ app.post("/likes/:id", async (req, res) => {
   }
 });
 
-// Increment play count
-app.post("/plays/:id", async (req, res) => {
+// Increment play count - with rate limiting
+const playLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 50, // limit each IP to 50 plays per windowMs
+  message: "Too many plays from this IP, please try again later."
+});
+app.post("/plays/:id", playLimiter, async (req, res) => {
   try {
+    if (!validator.isMongoId(req.params.id)) {
+      return res.status(400).json({ message: "Invalid beat ID" });
+    }
+
     const beat = await Beat.findById(req.params.id);
     if (!beat) return res.status(404).json({ message: "Beat not found" });
     beat.plays++;
@@ -389,25 +670,42 @@ app.post("/plays/:id", async (req, res) => {
 app.get("/genres", async (req, res) => {
   try {
     const genres = await Beat.distinct("genre");
-    res.json(["all", ...genres]);
+    res.json(["all", ...genres.sort()]);
   } catch (e) {
     console.error("Error fetching genres:", e);
     res.status(500).json({ message: "Failed to fetch genres" });
   }
 });
 
+// 404 handler
+app.use((req, res) => {
+  res.status(404).json({ message: "Endpoint not found" });
+});
+
 // Error handling middleware
 app.use((error, req, res, next) => {
+  console.error("Unhandled error:", error);
+
   if (error instanceof multer.MulterError) {
     if (error.code === 'LIMIT_FILE_SIZE') {
       return res.status(400).json({ message: 'File too large' });
     }
+    if (error.code === 'LIMIT_FILE_COUNT') {
+      return res.status(400).json({ message: 'Too many files' });
+    }
   }
-  res.status(500).json({ message: error.message });
+
+  // Don't leak error details in production
+  const message = NODE_ENV === 'production'
+    ? 'Something went wrong'
+    : error.message;
+
+  res.status(500).json({ message });
 });
 
 // Start server
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`Server running on port ${PORT}`);
+  console.log(`Environment: ${NODE_ENV}`);
   console.log(`Health check: http://0.0.0.0:${PORT}/health`);
 });
