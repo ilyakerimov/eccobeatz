@@ -121,33 +121,31 @@ const Admin = mongoose.model("Admin", {
 });
 
 // Create default admin if not exists
+// Create default admin if not exists
 async function createDefaultAdmin() {
   try {
-    const adminExists = await Admin.findOne({ username: "admin" });
-    if (!adminExists) {
-      const hashedPassword = await bcrypt.hash(DEFAULT_ADMIN_PASSWORD, 12); // Используем переменную окружения
-      const admin = new Admin({
+    let admin = await Admin.findOne({ username: "admin" });
+
+    if (!admin) {
+      // Создаем нового администратора
+      const hashedPassword = await bcrypt.hash(DEFAULT_ADMIN_PASSWORD, 12);
+      admin = new Admin({
         username: "admin",
         password: hashedPassword
       });
       await admin.save();
       console.log(`Default admin created: admin / ${DEFAULT_ADMIN_PASSWORD}`);
     } else {
-      // Обновляем пароль существующего администратора, если он не соответствует
-      const admin = await Admin.findOne({ username: "admin" });
-      const isPasswordCorrect = await bcrypt.compare(DEFAULT_ADMIN_PASSWORD, admin.password);
-      if (!isPasswordCorrect) {
-        const hashedPassword = await bcrypt.hash(DEFAULT_ADMIN_PASSWORD, 12);
-        admin.password = hashedPassword;
-        await admin.save();
-        console.log(`Admin password updated to: ${DEFAULT_ADMIN_PASSWORD}`);
-      }
+      // Всегда обновляем пароль на тот, что в переменной окружения
+      const hashedPassword = await bcrypt.hash(DEFAULT_ADMIN_PASSWORD, 12);
+      admin.password = hashedPassword;
+      await admin.save();
+      console.log(`Admin password updated to: ${DEFAULT_ADMIN_PASSWORD}`);
     }
   } catch (error) {
     console.error("Error creating/updating default admin:", error);
   }
 }
-createDefaultAdmin();
 
 // Multer configuration
 const storage = multer.diskStorage({
