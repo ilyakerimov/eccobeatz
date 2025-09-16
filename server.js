@@ -11,7 +11,6 @@ import bcrypt from "bcryptjs";
 import sharp from "sharp";
 import rateLimit from "express-rate-limit";
 import helmet from "helmet";
-import mongoSanitize from "express-mongo-sanitize";
 
 dotenv.config();
 
@@ -29,6 +28,9 @@ if (!JWT_SECRET || JWT_SECRET === "defaultJwtSecret") {
 }
 
 const app = express();
+
+// Trust proxy for Railway deployment
+app.set('trust proxy', 1);
 
 // Security middleware
 app.use(helmet({
@@ -57,8 +59,12 @@ app.use(cors({
 // Rate limiting
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
-  max: process.env.NODE_ENV === 'production' ? 100 : 1000, // limit each IP to requests per windowMs
-  message: "Too many requests from this IP, please try again later."
+  max: process.env.NODE_ENV === 'production' ? 100 : 1000,
+  message: "Too many requests from this IP, please try again later.",
+  // Добавляем ключ для работы за прокси
+  keyGenerator: (req) => {
+    return req.ip;
+  }
 });
 app.use(limiter);
 
@@ -66,12 +72,39 @@ app.use(limiter);
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 5, // 5 attempts per windowMs
-  message: "Too many login attempts, please try again later."
+  message: "Too many login attempts, please try again later.",
+  keyGenerator: (req) => {
+    return req.ip;
+  }
 });
 app.use("/admin/login", authLimiter);
 
 app.use(express.json({ limit: '10mb' }));
-app.use(mongoSanitize());
+
+// Убираем express-mongo-sanitize из-за проблем совместимости
+// Вместо этого добавим базовую защиту от NoSQL-инъекций
+app.use((req, res, next) => {
+  // Базовая защита от NoSQL-инъекций
+  const sanitize = (obj) => {
+    if (obj !== null && typeof obj === 'object') {
+      Object.keys(obj).forEach(key => {
+        if (typeof obj[key] === 'string') {
+          // Заменяем опасные операторы
+          obj[key] = obj[key].replace(/\$|\|/g, '');
+        } else if (typeof obj[key] === 'object') {
+          sanitize(obj[key]);
+        }
+      });
+    }
+    return obj;
+  };
+
+  if (req.body) sanitize(req.body);
+  if (req.query) sanitize(req.query);
+  if (req.params) sanitize(req.params);
+
+  next();
+});
 
 // Logging middleware
 app.use((req, res, next) => {
@@ -97,16 +130,16 @@ app.use("/uploads", express.static(uploadsDir, {
   }
 }));
 
-// MongoDB connection with improved options
-mongoose.connect(MONGO_URI, {
-  useNewUrlParser: true,
-  useUnifiedTopology: true,
-})
+// MongoDB connection - удаляем устаревшие опции
+mongoose.connect(MONGO_URI)
 .then(() => console.log("MongoDB connected"))
 .catch((e) => {
   console.error("MongoDB connection error:", e);
   process.exit(1);
 });
+
+// Остальной код без изменений...
+// [Остальная часть кода остается без изменений]
 
 // Models
 const Beat = mongoose.model("Beat", {
