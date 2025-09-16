@@ -121,13 +121,13 @@ const Admin = mongoose.model("Admin", {
 });
 
 // Create default admin if not exists
-// Create default admin if not exists
 async function createDefaultAdmin() {
   try {
+    console.log("Checking for default admin...");
     let admin = await Admin.findOne({ username: "admin" });
 
     if (!admin) {
-      // Создаем нового администратора
+      console.log("Admin not found, creating new one...");
       const hashedPassword = await bcrypt.hash(DEFAULT_ADMIN_PASSWORD, 12);
       admin = new Admin({
         username: "admin",
@@ -136,7 +136,7 @@ async function createDefaultAdmin() {
       await admin.save();
       console.log(`Default admin created: admin / ${DEFAULT_ADMIN_PASSWORD}`);
     } else {
-      // Всегда обновляем пароль на тот, что в переменной окружения
+      console.log("Admin found, updating password...");
       const hashedPassword = await bcrypt.hash(DEFAULT_ADMIN_PASSWORD, 12);
       admin.password = hashedPassword;
       await admin.save();
