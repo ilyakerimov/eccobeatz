@@ -21,6 +21,7 @@ const PORT = process.env.PORT || 4000;
 const MONGO_URI = process.env.MONGO_URI || "mongodb://127.0.0.1:27017/beats";
 const JWT_SECRET = process.env.JWT_SECRET || "defaultJwtSecret";
 const BASE_URL = process.env.BASE_URL || `http://localhost:${PORT}`;
+const DEFAULT_ADMIN_PASSWORD = process.env.DEFAULT_ADMIN_PASSWORD || "admin123"; // Default password if not set in env
 
 const app = express();
 
@@ -76,25 +77,14 @@ if (!fs.existsSync(uploadsDir)) {
 
 // Static file serving with proper headers
 app.use("/uploads", express.static(uploadsDir, {
-  setHeaders: (res, path) => {
-    if (path.endsWith('.mp3')) {
+  setHeaders: (res, filePath) => {
+    if (filePath.endsWith('.mp3')) {
       res.setHeader('Content-Type', 'audio/mpeg');
-    } else if (path.endsWith('.webp')) {
+    } else if (filePath.endsWith('.webp')) {
       res.setHeader('Content-Type', 'image/webp');
     }
   }
 }));
-
-// MongoDB connection with improved options
-mongoose.connect(MONGO_URI, {
-  useNewUrlParser: true,
-  useUnifiedTopology: true,
-})
-.then(() => console.log("MongoDB connected"))
-.catch((e) => {
-  console.error("MongoDB connection error:", e);
-  process.exit(1);
-});
 
 // Helper function to validate MongoDB ObjectId
 const isValidObjectId = (id) => {
@@ -102,7 +92,7 @@ const isValidObjectId = (id) => {
 };
 
 // Models
-const Beat = mongoose.model("Beat", {
+const Beat = mongoose.model("Beat", new mongoose.Schema({
   title: { type: String, required: true, maxlength: 100 },
   genre: { type: String, required: true, maxlength: 50 },
   likes: { type: Number, default: 0, min: 0 },
@@ -113,12 +103,12 @@ const Beat = mongoose.model("Beat", {
   price: { type: Number, default: 100, min: 0, max: 10000 },
   featured: { type: Boolean, default: false },
   description: { type: String, maxlength: 500 }
-});
+}));
 
-const Admin = mongoose.model("Admin", {
+const Admin = mongoose.model("Admin", new mongoose.Schema({
   username: { type: String, required: true, unique: true, minlength: 3, maxlength: 30 },
   password: { type: String, required: true, minlength: 6 }
-});
+}));
 
 // Create default admin if not exists
 async function createDefaultAdmin() {
@@ -128,15 +118,30 @@ async function createDefaultAdmin() {
 
     if (!admin) {
       console.log("Admin not found, creating new one...");
+
+      // Проверяем, что пароль установлен
+      if (!DEFAULT_ADMIN_PASSWORD) {
+        console.error("DEFAULT_ADMIN_PASSWORD is not set!");
+        return;
+      }
+
       const hashedPassword = await bcrypt.hash(DEFAULT_ADMIN_PASSWORD, 12);
       admin = new Admin({
         username: "admin",
         password: hashedPassword
       });
+
       await admin.save();
       console.log(`Default admin created: admin / ${DEFAULT_ADMIN_PASSWORD}`);
     } else {
       console.log("Admin found, updating password...");
+
+      // Проверяем, что пароль установлен
+      if (!DEFAULT_ADMIN_PASSWORD) {
+        console.error("DEFAULT_ADMIN_PASSWORD is not set!");
+        return;
+      }
+
       const hashedPassword = await bcrypt.hash(DEFAULT_ADMIN_PASSWORD, 12);
       admin.password = hashedPassword;
       await admin.save();
@@ -146,6 +151,20 @@ async function createDefaultAdmin() {
     console.error("Error creating/updating default admin:", error);
   }
 }
+
+// MongoDB connection with improved options
+mongoose.connect(MONGO_URI, {
+  useNewUrlParser: true,
+  useUnifiedTopology: true,
+})
+.then(() => {
+  console.log("MongoDB connected");
+  createDefaultAdmin(); // Вызываем после подключения к БД
+})
+.catch((e) => {
+  console.error("MongoDB connection error:", e);
+  process.exit(1);
+});
 
 // Multer configuration
 const storage = multer.diskStorage({
