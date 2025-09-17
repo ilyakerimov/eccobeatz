@@ -12,7 +12,9 @@ import sharp from "sharp";
 import rateLimit from "express-rate-limit";
 import helmet from "helmet";
 import compression from "compression";
-
+import crypto from "crypto";
+import { JSDOM } from "jsdom";
+import createDOMPurify from "dompurify";
 
 dotenv.config();
 
@@ -21,9 +23,15 @@ const __dirname = path.dirname(__filename);
 
 const PORT = process.env.PORT || 4000;
 const MONGO_URI = process.env.MONGO_URI || "mongodb://127.0.0.1:27017/beats";
-const JWT_SECRET = process.env.JWT_SECRET || "defaultJwtSecret";
+const JWT_SECRET = process.env.JWT_SECRET || crypto.randomBytes(64).toString('hex');
+const JWT_REFRESH_SECRET = process.env.JWT_REFRESH_SECRET || crypto.randomBytes(64).toString('hex');
 const BASE_URL = process.env.BASE_URL || `http://localhost:${PORT}`;
-const DEFAULT_ADMIN_PASSWORD = process.env.DEFAULT_ADMIN_PASSWORD || "admin123"; // Default password if not set in env
+const DEFAULT_ADMIN_PASSWORD = process.env.DEFAULT_ADMIN_PASSWORD || crypto.randomBytes(12).toString('hex');
+const NODE_ENV = process.env.NODE_ENV || 'development';
+
+// Initialize DOM Purify for HTML sanitization
+const window = new JSDOM('').window;
+const DOMPurify = createDOMPurify(window);
 
 const app = express();
 
@@ -32,32 +40,38 @@ app.use(helmet({
   contentSecurityPolicy: {
     directives: {
       defaultSrc: ["'self'"],
-      scriptSrc: ["'self'", "'unsafe-inline'"],
-      styleSrc: ["'self'", "'unsafe-inline'"],
-      imgSrc: ["'self'", "data:", "blob:"],
-      mediaSrc: ["'self'", "data:", "blob:"],
+      scriptSrc: ["'self'"],
+      styleSrc: ["'self'"],
+      imgSrc: ["'self'", "data:"],
+      mediaSrc: ["'self'", "data:"],
+      connectSrc: ["'self'"],
+      fontSrc: ["'self'"],
+      objectSrc: ["'none'"],
+      frameSrc: ["'none'"]
     },
   },
-  crossOriginResourcePolicy: { policy: "cross-origin" }
+  crossOriginResourcePolicy: { policy: "same-site" },
+  referrerPolicy: { policy: 'same-origin' }
 }));
 
 // Enhanced CORS configuration
 app.use(cors({
-  origin: process.env.NODE_ENV === 'production' ? process.env.FRONTEND_URL : "*",
+  origin: NODE_ENV === 'production' ? process.env.FRONTEND_URL : "http://localhost:3000",
   methods: ["GET", "POST", "PUT", "DELETE"],
-  credentials: false
+  credentials: true
 }));
 
 app.use(express.json({ limit: '10mb' }));
 
 // Rate limiting
 const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 100 // limit each IP to 100 requests per windowMs
+  windowMs: 15 * 60 * 1000,
+  max: 100,
+  message: 'Too many requests from this IP'
 });
 app.use(limiter);
 
-// stricter limiting for auth endpoints
+// Stricter limiting for auth endpoints
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 5,
@@ -71,6 +85,32 @@ app.use((req, res, next) => {
   next();
 });
 
+// NoSQL injection protection middleware
+app.use((req, res, next) => {
+  const sanitize = (obj) => {
+    if (obj && typeof obj === 'object') {
+      for (let key in obj) {
+        if (typeof obj[key] === 'string') {
+          if (obj[key].startsWith('$')) {
+            throw new Error('Potential NoSQL injection detected');
+          }
+        } else if (typeof obj[key] === 'object') {
+          sanitize(obj[key]);
+        }
+      }
+    }
+  };
+
+  try {
+    sanitize(req.body);
+    sanitize(req.query);
+    sanitize(req.params);
+    next();
+  } catch (e) {
+    res.status(400).json({ message: 'Invalid input' });
+  }
+});
+
 // Ensure uploads directory exists
 const uploadsDir = path.join(__dirname, "uploads");
 if (!fs.existsSync(uploadsDir)) {
@@ -82,6 +122,7 @@ app.use("/uploads", express.static(uploadsDir, {
   setHeaders: (res, filePath) => {
     if (filePath.endsWith('.mp3')) {
       res.setHeader('Content-Type', 'audio/mpeg');
+      res.setHeader('Content-Disposition', 'inline');
     } else if (filePath.endsWith('.webp')) {
       res.setHeader('Content-Type', 'image/webp');
     }
@@ -109,7 +150,14 @@ const Beat = mongoose.model("Beat", new mongoose.Schema({
 
 const Admin = mongoose.model("Admin", new mongoose.Schema({
   username: { type: String, required: true, unique: true, minlength: 3, maxlength: 30 },
-  password: { type: String, required: true, minlength: 6 }
+  password: { type: String, required: true, minlength: 6 },
+  lastLogin: { type: Date, default: Date.now }
+}));
+
+const RefreshToken = mongoose.model("RefreshToken", new mongoose.Schema({
+  token: { type: String, required: true },
+  userId: { type: mongoose.Schema.Types.ObjectId, ref: 'Admin', required: true },
+  expiresAt: { type: Date, required: true }
 }));
 
 // Create default admin if not exists
@@ -121,7 +169,6 @@ async function createDefaultAdmin() {
     if (!admin) {
       console.log("Admin not found, creating new one...");
 
-      // Проверяем, что пароль установлен
       if (!DEFAULT_ADMIN_PASSWORD) {
         console.error("DEFAULT_ADMIN_PASSWORD is not set!");
         return;
@@ -138,7 +185,6 @@ async function createDefaultAdmin() {
     } else {
       console.log("Admin found, updating password...");
 
-      // Проверяем, что пароль установлен
       if (!DEFAULT_ADMIN_PASSWORD) {
         console.error("DEFAULT_ADMIN_PASSWORD is not set!");
         return;
@@ -161,7 +207,7 @@ mongoose.connect(MONGO_URI, {
 })
 .then(() => {
   console.log("MongoDB connected");
-  createDefaultAdmin(); // Вызываем после подключения к БД
+  createDefaultAdmin();
 })
 .catch((e) => {
   console.error("MongoDB connection error:", e);
@@ -172,22 +218,19 @@ mongoose.connect(MONGO_URI, {
 const storage = multer.diskStorage({
   destination: (req, file, cb) => cb(null, uploadsDir),
   filename: (req, file, cb) =>
-    cb(null, Date.now() + "-" + Math.round(Math.random() * 1e9) + path.extname(file.originalname)),
+    cb(null, Date.now() + "-" + crypto.randomBytes(8).toString('hex') + path.extname(file.originalname)),
 });
 
 const upload = multer({
   storage,
   fileFilter: (req, file, cb) => {
-    // Check file types
     if (file.fieldname === 'file') {
-      // Audio files
       if (file.mimetype.startsWith('audio/')) {
         cb(null, true);
       } else {
         cb(new Error('Only audio files are allowed for the audio field'), false);
       }
     } else if (file.fieldname === 'cover') {
-      // Image files
       if (file.mimetype.startsWith('image/')) {
         cb(null, true);
       } else {
@@ -198,14 +241,30 @@ const upload = multer({
     }
   },
   limits: {
-    fileSize: 50 * 1024 * 1024, // 50MB limit
+    fileSize: 50 * 1024 * 1024,
   }
 });
+
+// Generate tokens
+const generateTokens = (userId, username) => {
+  const accessToken = jwt.sign(
+    { userId, username },
+    JWT_SECRET,
+    { expiresIn: '15m' }
+  );
+
+  const refreshToken = jwt.sign(
+    { userId, username },
+    JWT_REFRESH_SECRET,
+    { expiresIn: '7d' }
+  );
+
+  return { accessToken, refreshToken };
+};
 
 // Middleware to add base URL to beats
 function addBaseUrlToBeats(beats) {
   const convertBeat = (beat) => {
-    // If beat is a Mongoose object, convert to plain object
     const plainBeat = beat.toObject ? beat.toObject() : beat;
     return {
       ...plainBeat,
@@ -242,6 +301,14 @@ const validateBeatInput = (req, res, next) => {
     return res.status(400).json({ message: "Description too long" });
   }
 
+  // Sanitize HTML input
+  if (description) {
+    req.body.description = DOMPurify.sanitize(description, {
+      ALLOWED_TAGS: [],
+      ALLOWED_ATTR: []
+    });
+  }
+
   next();
 };
 
@@ -268,33 +335,138 @@ app.get("/health", (req, res) => {
   res.status(200).json({ status: "OK", message: "Server is running" });
 });
 
-// Admin login endpoint
-app.post("/admin/login", async (req, res) => {
+// CSRF token endpoint
+app.get("/csrf-token", (req, res) => {
+  const csrfToken = crypto.randomBytes(32).toString('hex');
+  res.cookie('XSRF-TOKEN', csrfToken, {
+    httpOnly: false,
+    secure: NODE_ENV === 'production',
+    sameSite: 'strict'
+  });
+  res.json({ csrfToken });
+});
+
+// Admin login endpoint with delay to prevent timing attacks
+app.post("/admin/login", authLimiter, async (req, res) => {
   try {
+    // Add artificial delay to prevent timing attacks
+    await new Promise(resolve => setTimeout(resolve, 500));
+
     const { username, password } = req.body;
 
-    // Basic validation
     if (!username || !password) {
       return res.status(400).json({ message: "Username and password are required" });
     }
 
     const admin = await Admin.findOne({ username });
     if (!admin) {
-      // Use generic message to prevent username enumeration
+      await new Promise(resolve => setTimeout(resolve, 500));
       return res.status(401).json({ message: "Invalid credentials" });
     }
 
     const validPassword = await bcrypt.compare(password, admin.password);
     if (!validPassword) {
+      await new Promise(resolve => setTimeout(resolve, 500));
       return res.status(401).json({ message: "Invalid credentials" });
     }
 
-    const token = jwt.sign({ userId: admin._id, username: admin.username }, JWT_SECRET, { expiresIn: "24h" });
+    // Update last login
+    admin.lastLogin = new Date();
+    await admin.save();
 
-    res.json({ token, username: admin.username });
+    const tokens = generateTokens(admin._id, admin.username);
+
+    // Store refresh token in database
+    const refreshTokenDoc = new RefreshToken({
+      token: tokens.refreshToken,
+      userId: admin._id,
+      expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000) // 7 days
+    });
+    await refreshTokenDoc.save();
+
+    // Set refresh token as HTTP-only cookie
+    res.cookie('refreshToken', tokens.refreshToken, {
+      httpOnly: true,
+      secure: NODE_ENV === 'production',
+      sameSite: 'strict',
+      maxAge: 7 * 24 * 60 * 60 * 1000 // 7 days
+    });
+
+    res.json({
+      token: tokens.accessToken,
+      username: admin.username,
+      expiresIn: 15 * 60 * 1000 // 15 minutes
+    });
   } catch (e) {
     console.error("Login error:", e);
     res.status(500).json({ message: "Login failed" });
+  }
+});
+
+// Refresh token endpoint
+app.post("/admin/refresh", async (req, res) => {
+  try {
+    const refreshToken = req.cookies.refreshToken;
+
+    if (!refreshToken) {
+      return res.status(401).json({ message: "Refresh token required" });
+    }
+
+    // Verify refresh token
+    const decoded = jwt.verify(refreshToken, JWT_REFRESH_SECRET);
+
+    // Check if token exists in database
+    const tokenDoc = await RefreshToken.findOne({
+      token: refreshToken,
+      userId: decoded.userId
+    });
+
+    if (!tokenDoc || tokenDoc.expiresAt < new Date()) {
+      return res.status(403).json({ message: "Invalid refresh token" });
+    }
+
+    // Generate new tokens
+    const tokens = generateTokens(decoded.userId, decoded.username);
+
+    // Update refresh token in database
+    tokenDoc.token = tokens.refreshToken;
+    tokenDoc.expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+    await tokenDoc.save();
+
+    // Set new refresh token as HTTP-only cookie
+    res.cookie('refreshToken', tokens.refreshToken, {
+      httpOnly: true,
+      secure: NODE_ENV === 'production',
+      sameSite: 'strict',
+      maxAge: 7 * 24 * 60 * 60 * 1000
+    });
+
+    res.json({
+      token: tokens.accessToken,
+      expiresIn: 15 * 60 * 1000
+    });
+  } catch (error) {
+    console.error("Token refresh error:", error);
+    res.status(403).json({ message: "Invalid refresh token" });
+  }
+});
+
+// Admin logout endpoint
+app.post("/admin/logout", authenticateToken, async (req, res) => {
+  try {
+    const refreshToken = req.cookies.refreshToken;
+
+    if (refreshToken) {
+      // Remove refresh token from database
+      await RefreshToken.deleteOne({ token: refreshToken });
+    }
+
+    // Clear refresh token cookie
+    res.clearCookie('refreshToken');
+    res.json({ message: "Logged out successfully" });
+  } catch (error) {
+    console.error("Logout error:", error);
+    res.status(500).json({ message: "Logout failed" });
   }
 });
 
@@ -337,9 +509,6 @@ app.get("/beats/:id", async (req, res) => {
 // Create new beat (admin only)
 app.post("/beats", authenticateToken, upload.fields([{ name: "file" }, { name: "cover" }]), validateBeatInput, async (req, res) => {
   try {
-    console.log("Files received:", req.files);
-    console.log("Body received:", req.body);
-
     if (!req.files?.file?.[0]) {
       return res.status(400).json({ message: "Audio file is required" });
     }
@@ -359,17 +528,15 @@ app.post("/beats", authenticateToken, upload.fields([{ name: "file" }, { name: "
       try {
         // Convert image to WebP
         await sharp(originalCoverPath)
-          .webp({ quality: 80 }) // 80% quality
+          .webp({ quality: 80 })
           .toFile(newCoverPath);
 
         // Delete original file
         fs.unlinkSync(originalCoverPath);
 
         coverName = newCoverName;
-        console.log("Cover converted to WebP:", coverName);
       } catch (convertError) {
         console.error("Error converting cover to WebP:", convertError);
-        // In case of error, keep the original file
         coverName = coverFile.filename;
       }
     }
@@ -385,7 +552,6 @@ app.post("/beats", authenticateToken, upload.fields([{ name: "file" }, { name: "
     });
 
     await beat.save();
-    console.log("Beat saved successfully:", beat);
 
     // Convert Mongoose object to plain JS object
     const beatObject = beat.toObject();
@@ -512,18 +678,30 @@ app.get("/genres", async (req, res) => {
 
 // Error handling middleware
 app.use((error, req, res, next) => {
-  if (error instanceof multer.MulterError) {
-    if (error.code === 'LIMIT_FILE_SIZE') {
-      return res.status(400).json({ message: 'File too large' });
-    }
-  }
+  console.error('Error:', error);
 
-  // Don't expose error details in production
   if (process.env.NODE_ENV === 'production') {
-    return res.status(500).json({ message: 'Something went wrong' });
-  }
+    if (error instanceof multer.MulterError) {
+      if (error.code === 'LIMIT_FILE_SIZE') {
+        return res.status(400).json({ message: 'File too large' });
+      }
+    }
 
-  res.status(500).json({ message: error.message });
+    if (error.name === 'JsonWebTokenError') {
+      return res.status(401).json({ message: 'Invalid token' });
+    }
+
+    if (error.name === 'TokenExpiredError') {
+      return res.status(401).json({ message: 'Token expired' });
+    }
+
+    return res.status(500).json({ message: 'Internal server error' });
+  } else {
+    res.status(500).json({
+      message: error.message,
+      stack: error.stack
+    });
+  }
 });
 
 // 404 handler
@@ -534,5 +712,6 @@ app.use((req, res) => {
 // Start server
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`Server running on port ${PORT}`);
+  console.log(`Environment: ${NODE_ENV}`);
   console.log(`Health check: http://0.0.0.0:${PORT}/health`);
 });
