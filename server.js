@@ -54,12 +54,12 @@ app.use(helmet({
   referrerPolicy: { policy: 'strict-origin-when-cross-origin' }
 }));
 
-// Enhanced CORS configuration
+// Enhanced CORS configuration - добавлен X-CSRF-Token в allowedHeaders
 app.use(cors({
   origin: FRONTEND_URL,
   methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
   credentials: true,
-  allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With"]
+  allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With", "X-CSRF-Token"]
 }));
 
 // Handle preflight requests
@@ -331,15 +331,18 @@ app.get("/health", (req, res) => {
   res.status(200).json({ status: "OK", message: "Server is running" });
 });
 
-// CSRF token endpoint
+// CSRF token endpoint - обновлено для production
 app.get("/csrf-token", (req, res) => {
   const csrfToken = crypto.randomBytes(32).toString('hex');
+
+  // Установка куки с правильными настройками для production
   res.cookie('XSRF-TOKEN', csrfToken, {
     httpOnly: false,
     secure: NODE_ENV === 'production',
     sameSite: NODE_ENV === 'production' ? 'none' : 'lax',
     domain: NODE_ENV === 'production' ? new URL(FRONTEND_URL).hostname : 'localhost'
   });
+
   res.json({ csrfToken });
 });
 
@@ -381,7 +384,7 @@ app.post("/admin/login", authLimiter, async (req, res) => {
     });
     await refreshTokenDoc.save();
 
-    // Set refresh token as HTTP-only cookie
+    // Set refresh token as HTTP-only cookie - обновлено для production
     res.cookie('refreshToken', tokens.refreshToken, {
       httpOnly: true,
       secure: NODE_ENV === 'production',
@@ -431,7 +434,7 @@ app.post("/admin/refresh", async (req, res) => {
     tokenDoc.expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
     await tokenDoc.save();
 
-    // Set new refresh token as HTTP-only cookie
+    // Set new refresh token as HTTP-only cookie - обновлено для production
     res.cookie('refreshToken', tokens.refreshToken, {
       httpOnly: true,
       secure: NODE_ENV === 'production',
@@ -460,12 +463,13 @@ app.post("/admin/logout", authenticateToken, async (req, res) => {
       await RefreshToken.deleteOne({ token: refreshToken });
     }
 
-    // Clear refresh token cookie
+    // Clear refresh token cookie - обновлено для production
     res.clearCookie('refreshToken', {
       domain: NODE_ENV === 'production' ? new URL(FRONTEND_URL).hostname : 'localhost',
       secure: NODE_ENV === 'production',
       sameSite: NODE_ENV === 'production' ? 'none' : 'lax'
     });
+
     res.json({ message: "Logged out successfully" });
   } catch (error) {
     console.error("Logout error:", error);
