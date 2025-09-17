@@ -13,8 +13,7 @@ import rateLimit from "express-rate-limit";
 import helmet from "helmet";
 import compression from "compression";
 import crypto from "crypto";
-import { JSDOM } from "jsdom";
-import createDOMPurify from "dompurify";
+import sanitizeHtml from "sanitize-html";
 
 dotenv.config();
 
@@ -28,10 +27,6 @@ const JWT_REFRESH_SECRET = process.env.JWT_REFRESH_SECRET || crypto.randomBytes(
 const BASE_URL = process.env.BASE_URL || `http://localhost:${PORT}`;
 const DEFAULT_ADMIN_PASSWORD = process.env.DEFAULT_ADMIN_PASSWORD || crypto.randomBytes(12).toString('hex');
 const NODE_ENV = process.env.NODE_ENV || 'development';
-
-// Initialize DOM Purify for HTML sanitization
-const window = new JSDOM('').window;
-const DOMPurify = createDOMPurify(window);
 
 const app = express();
 
@@ -303,9 +298,9 @@ const validateBeatInput = (req, res, next) => {
 
   // Sanitize HTML input
   if (description) {
-    req.body.description = DOMPurify.sanitize(description, {
-      ALLOWED_TAGS: [],
-      ALLOWED_ATTR: []
+    req.body.description = sanitizeHtml(description, {
+      allowedTags: [],
+      allowedAttributes: {}
     });
   }
 
