@@ -17,8 +17,7 @@ import sanitizeHtml from "sanitize-html";
 import cookieParser from "cookie-parser";
 import { S3Client, PutObjectCommand, DeleteObjectCommand, GetObjectCommand } from "@aws-sdk/client-s3";
 import { createReadStream } from "fs";
-import { Upload } from "@aws-sdk/lib-storage";
-import mime from "mime-types";
+import { uploadToCloudStorage, deleteFromCloudStorage, getCloudStorageUrl } from "./cloud-storage.js";
 
 dotenv.config();
 
@@ -32,38 +31,10 @@ const JWT_REFRESH_SECRET = process.env.JWT_REFRESH_SECRET || crypto.randomBytes(
 const BASE_URL = process.env.BASE_URL || `http://localhost:${PORT}`;
 const FRONTEND_URL = process.env.FRONTEND_URL || "http://localhost:3000";
 const NODE_ENV = process.env.NODE_ENV || 'development';
-
-// Yandex Cloud S3 configuration
-const S3_ENDPOINT = process.env.S3_ENDPOINT || "https://storage.yandexcloud.net";
-const S3_BUCKET = process.env.S3_BUCKET;
-const S3_ACCESS_KEY = process.env.S3_ACCESS_KEY;
-const S3_SECRET_KEY = process.env.S3_SECRET_KEY;
-const S3_REGION = process.env.S3_REGION || "ru-central1";
-
-// Initialize S3 client if credentials are provided
-let s3Client = null;
-if (S3_ACCESS_KEY && S3_SECRET_KEY && S3_BUCKET) {
-  s3Client = new S3Client({
-    region: S3_REGION,
-    endpoint: S3_ENDPOINT,
-    credentials: {
-      accessKeyId: S3_ACCESS_KEY,
-      secretAccessKey: S3_SECRET_KEY,
-    },
-    forcePathStyle: true,
-  });
-  console.log("S3 storage configured");
-} else {
-  console.log("S3 storage not configured, using local storage");
-}
+const USE_CLOUD_STORAGE = process.env.USE_CLOUD_STORAGE === 'true';
+const STORAGE_TYPE = USE_CLOUD_STORAGE ? 'cloud' : 'local';
 
 const app = express();
-
-// Compression middleware
-app.use(compression());
-
-// Cookie parser middleware
-app.use(cookieParser());
 
 // Security middleware
 app.use(helmet({
@@ -72,9 +43,9 @@ app.use(helmet({
       defaultSrc: ["'self'", FRONTEND_URL],
       scriptSrc: ["'self'", "'unsafe-inline'", FRONTEND_URL],
       styleSrc: ["'self'", "'unsafe-inline'", FRONTEND_URL],
-      imgSrc: ["'self'", "data:", "blob:", FRONTEND_URL, BASE_URL, S3_ENDPOINT],
-      mediaSrc: ["'self'", "data:", "blob:", FRONTEND_URL, BASE_URL, S3_ENDPOINT],
-      connectSrc: ["'self'", FRONTEND_URL, BASE_URL, S3_ENDPOINT],
+      imgSrc: ["'self'", "data:", "blob:", FRONTEND_URL, BASE_URL],
+      mediaSrc: ["'self'", "data:", "blob:", FRONTEND_URL, BASE_URL],
+      connectSrc: ["'self'", FRONTEND_URL, BASE_URL],
       fontSrc: ["'self'", FRONTEND_URL],
       objectSrc: ["'none'"],
       frameSrc: ["'none'"]
@@ -98,12 +69,16 @@ app.options('*', cors());
 
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+app.use(compression());
+app.use(cookieParser());
 
 // Rate limiting
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 100,
-  message: 'Too many requests from this IP'
+  message: 'Too many requests from this IP',
+  standardHeaders: true,
+  legacyHeaders: false,
 });
 app.use(limiter);
 
@@ -117,7 +92,7 @@ app.use("/admin/login", authLimiter);
 
 // Logging middleware
 app.use((req, res, next) => {
-  console.log(`${new Date().toISOString()} - ${req.method} ${req.path} - ${req.ip}`);
+  console.log(`${new Date().toISOString()} - ${req.method} ${req.path} - ${req.ip} - ${req.get('User-Agent')}`);
   next();
 });
 
@@ -128,42 +103,44 @@ app.use((req, res, next) => {
       for (let key in obj) {
         if (typeof obj[key] === 'string') {
           if (obj[key].startsWith('$')) {
-            throw new Error('Potential NoSQL injection detected');
+            return res.status(400).json({ message: 'Invalid input' });
           }
         } else if (typeof obj[key] === 'object') {
-          sanitize(obj[key]);
+          const result = sanitize(obj[key]);
+          if (result) return result;
         }
       }
     }
+    return null;
   };
 
-  try {
-    sanitize(req.body);
-    sanitize(req.query);
-    sanitize(req.params);
-    next();
-  } catch (e) {
-    res.status(400).json({ message: 'Invalid input' });
-  }
+  const bodyResult = sanitize(req.body);
+  if (bodyResult) return bodyResult;
+
+  const queryResult = sanitize(req.query);
+  if (queryResult) return queryResult;
+
+  const paramsResult = sanitize(req.params);
+  if (paramsResult) return paramsResult;
+
+  next();
 });
 
-// Ensure uploads directory exists for local storage
+// Ensure uploads directory exists
 const uploadsDir = path.join(__dirname, "uploads");
 if (!fs.existsSync(uploadsDir)) {
   fs.mkdirSync(uploadsDir, { recursive: true });
 }
 
-// Static file serving with proper headers (for local storage)
-if (!s3Client) {
+// Static file serving with proper headers
+if (!USE_CLOUD_STORAGE) {
   app.use("/uploads", express.static(uploadsDir, {
     setHeaders: (res, filePath) => {
       if (filePath.endsWith('.mp3')) {
         res.setHeader('Content-Type', 'audio/mpeg');
         res.setHeader('Content-Disposition', 'inline');
-        res.setHeader('Cache-Control', 'public, max-age=86400'); // 1 day cache for audio
       } else if (filePath.endsWith('.webp')) {
         res.setHeader('Content-Type', 'image/webp');
-        res.setHeader('Cache-Control', 'public, max-age=2592000'); // 30 days cache for images
       }
     }
   }));
@@ -172,65 +149,6 @@ if (!s3Client) {
 // Helper function to validate MongoDB ObjectId
 const isValidObjectId = (id) => {
   return mongoose.Types.ObjectId.isValid(id);
-};
-
-// File storage functions
-const uploadFileToStorage = async (fileBuffer, fileName, mimeType) => {
-  if (s3Client) {
-    // Upload to Yandex Cloud S3
-    const key = `beats/${Date.now()}-${crypto.randomBytes(8).toString('hex')}-${fileName}`;
-
-    const uploadParams = {
-      Bucket: S3_BUCKET,
-      Key: key,
-      Body: fileBuffer,
-      ContentType: mimeType,
-      ACL: 'public-read'
-    };
-
-    try {
-      const parallelUploads3 = new Upload({
-        client: s3Client,
-        params: uploadParams,
-      });
-
-      await parallelUploads3.done();
-      return `${S3_ENDPOINT}/${S3_BUCKET}/${key}`;
-    } catch (error) {
-      console.error("S3 upload error:", error);
-      throw new Error("Failed to upload file to cloud storage");
-    }
-  } else {
-    // Local storage
-    const filePath = path.join(uploadsDir, fileName);
-    fs.writeFileSync(filePath, fileBuffer);
-    return `/uploads/${fileName}`;
-  }
-};
-
-const deleteFileFromStorage = async (fileUrl) => {
-  if (!fileUrl) return;
-
-  if (s3Client && fileUrl.includes(S3_ENDPOINT)) {
-    // Delete from S3
-    try {
-      const key = fileUrl.replace(`${S3_ENDPOINT}/${S3_BUCKET}/`, '');
-      const deleteParams = {
-        Bucket: S3_BUCKET,
-        Key: key,
-      };
-
-      await s3Client.send(new DeleteObjectCommand(deleteParams));
-    } catch (error) {
-      console.error("S3 delete error:", error);
-    }
-  } else if (fileUrl.startsWith('/uploads/')) {
-    // Delete from local storage
-    const filePath = path.join(__dirname, fileUrl);
-    if (fs.existsSync(filePath)) {
-      fs.unlinkSync(filePath);
-    }
-  }
 };
 
 // Models
@@ -244,19 +162,23 @@ const Beat = mongoose.model("Beat", new mongoose.Schema({
   date: { type: Date, default: Date.now },
   price: { type: Number, default: 100, min: 0, max: 10000 },
   featured: { type: Boolean, default: false },
-  description: { type: String, maxlength: 500 }
+  description: { type: String, maxlength: 500 },
+  storageType: { type: String, default: STORAGE_TYPE, enum: ['local', 'cloud'] }
 }));
 
 const Admin = mongoose.model("Admin", new mongoose.Schema({
   username: { type: String, required: true, unique: true, minlength: 3, maxlength: 30 },
   password: { type: String, required: true, minlength: 6 },
-  lastLogin: { type: Date, default: Date.now }
+  lastLogin: { type: Date, default: Date.now },
+  loginAttempts: { type: Number, default: 0 },
+  lockUntil: { type: Number }
 }));
 
 const RefreshToken = mongoose.model("RefreshToken", new mongoose.Schema({
   token: { type: String, required: true },
   userId: { type: mongoose.Schema.Types.ObjectId, ref: 'Admin', required: true },
-  expiresAt: { type: Date, required: true }
+  expiresAt: { type: Date, required: true },
+  createdAt: { type: Date, default: Date.now, expires: '7d' }
 }));
 
 // Create default admin if not exists
@@ -294,6 +216,8 @@ async function createDefaultAdmin() {
 mongoose.connect(MONGO_URI, {
   useNewUrlParser: true,
   useUnifiedTopology: true,
+  serverSelectionTimeoutMS: 5000,
+  socketTimeoutMS: 45000,
 })
 .then(() => {
   console.log("MongoDB connected");
@@ -304,10 +228,15 @@ mongoose.connect(MONGO_URI, {
   process.exit(1);
 });
 
-// Multer configuration for memory storage
-const memoryStorage = multer.memoryStorage();
+// Multer configuration
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => cb(null, uploadsDir),
+  filename: (req, file, cb) =>
+    cb(null, Date.now() + "-" + crypto.randomBytes(8).toString('hex') + path.extname(file.originalname)),
+});
+
 const upload = multer({
-  storage: memoryStorage,
+  storage,
   fileFilter: (req, file, cb) => {
     if (file.fieldname === 'file') {
       if (file.mimetype.startsWith('audio/')) {
@@ -349,13 +278,19 @@ const generateTokens = (userId, username) => {
 
 // Middleware to add base URL to beats
 function addBaseUrlToBeats(beats) {
-  // For S3 storage, URLs are already absolute
-  if (s3Client) {
-    return beats;
-  }
-
   const convertBeat = (beat) => {
     const plainBeat = beat.toObject ? beat.toObject() : beat;
+
+    // Use cloud storage URL if file is stored in cloud
+    if (plainBeat.storageType === 'cloud') {
+      return {
+        ...plainBeat,
+        fileUrl: plainBeat.fileUrl ? getCloudStorageUrl(plainBeat.fileUrl) : null,
+        coverUrl: plainBeat.coverUrl ? getCloudStorageUrl(plainBeat.coverUrl) : null
+      };
+    }
+
+    // Use local storage URL
     return {
       ...plainBeat,
       fileUrl: plainBeat.fileUrl ? `${BASE_URL}${plainBeat.fileUrl}` : null,
@@ -425,7 +360,8 @@ app.get("/health", (req, res) => {
   res.status(200).json({
     status: "OK",
     message: "Server is running",
-    storage: s3Client ? "S3" : "local"
+    storage: STORAGE_TYPE,
+    environment: NODE_ENV
   });
 });
 
@@ -433,7 +369,6 @@ app.get("/health", (req, res) => {
 app.get("/csrf-token", (req, res) => {
   const csrfToken = crypto.randomBytes(32).toString('hex');
 
-  // Set cookie with proper settings for production
   res.cookie('XSRF-TOKEN', csrfToken, {
     httpOnly: false,
     secure: NODE_ENV === 'production',
@@ -444,11 +379,11 @@ app.get("/csrf-token", (req, res) => {
   res.json({ csrfToken });
 });
 
-// Admin login endpoint with delay to prevent timing attacks
+// Admin login endpoint with brute force protection
 app.post("/admin/login", authLimiter, async (req, res) => {
   try {
     // Add artificial delay to prevent timing attacks
-    await new Promise(resolve => setTimeout(resolve, 500));
+    await new Promise(resolve => setTimeout(resolve, 500 + Math.random() * 500));
 
     const { username, password } = req.body;
 
@@ -457,18 +392,36 @@ app.post("/admin/login", authLimiter, async (req, res) => {
     }
 
     const admin = await Admin.findOne({ username });
-    if (!admin) {
-      await new Promise(resolve => setTimeout(resolve, 500));
+
+    // Check if account is locked
+    if (admin && admin.lockUntil && admin.lockUntil > Date.now()) {
+      const retryAfter = Math.ceil((admin.lockUntil - Date.now()) / 1000);
+      return res.status(429).json({
+        message: "Account locked due to too many failed attempts",
+        retryAfter
+      });
+    }
+
+    if (!admin || !(await bcrypt.compare(password, admin.password))) {
+      // Increment failed attempts
+      if (admin) {
+        admin.loginAttempts += 1;
+
+        // Lock account after 5 failed attempts for 15 minutes
+        if (admin.loginAttempts >= 5) {
+          admin.lockUntil = Date.now() + 15 * 60 * 1000;
+          admin.loginAttempts = 0;
+        }
+
+        await admin.save();
+      }
+
       return res.status(401).json({ message: "Invalid credentials" });
     }
 
-    const validPassword = await bcrypt.compare(password, admin.password);
-    if (!validPassword) {
-      await new Promise(resolve => setTimeout(resolve, 500));
-      return res.status(401).json({ message: "Invalid credentials" });
-    }
-
-    // Update last login
+    // Reset login attempts on successful login
+    admin.loginAttempts = 0;
+    admin.lockUntil = undefined;
     admin.lastLogin = new Date();
     await admin.save();
 
@@ -578,19 +531,32 @@ app.post("/admin/logout", authenticateToken, async (req, res) => {
 // Get all beats with genre filter
 app.get("/beats", async (req, res) => {
   try {
-    const { genre, featured } = req.query;
+    const { genre, page = 1, limit = 10, featured } = req.query;
     let filter = {};
 
     if (genre && genre !== "all") {
       filter.genre = new RegExp(`^${genre}$`, 'i');
     }
 
-    if (featured === "true") {
+    if (featured === 'true') {
       filter.featured = true;
     }
 
-    const beats = await Beat.find(filter).sort({ date: -1 });
-    res.json(addBaseUrlToBeats(beats));
+    const options = {
+      page: parseInt(page),
+      limit: parseInt(limit),
+      sort: { date: -1 }
+    };
+
+    const beats = await Beat.paginate(filter, options);
+
+    // Add base URL to beats
+    const response = {
+      ...beats,
+      docs: addBaseUrlToBeats(beats.docs)
+    };
+
+    res.json(response);
   } catch (e) {
     console.error("Error fetching beats:", e);
     res.status(500).json({ message: "Failed to fetch beats" });
@@ -623,45 +589,50 @@ app.post("/beats", authenticateToken, upload.fields([{ name: "file" }, { name: "
     }
 
     const audioFile = req.files.file[0];
-    let coverFile = req.files?.cover?.[0];
+    let audioUrl, coverUrl;
 
-    // Upload audio file
-    const audioFileName = `${Date.now()}-${crypto.randomBytes(8).toString('hex')}${path.extname(audioFile.originalname)}`;
-    const audioUrl = await uploadFileToStorage(
-      audioFile.buffer,
-      audioFileName,
-      audioFile.mimetype
-    );
-
-    let coverUrl = null;
+    // Process audio file
+    if (USE_CLOUD_STORAGE) {
+      audioUrl = await uploadToCloudStorage(audioFile.path, `audio/${audioFile.filename}`, audioFile.mimetype);
+      // Remove local file after upload
+      fs.unlinkSync(audioFile.path);
+    } else {
+      audioUrl = `/uploads/${audioFile.filename}`;
+    }
 
     // Process cover image if exists
-    if (coverFile) {
-      try {
-        // Convert image to WebP and resize
-        const webpBuffer = await sharp(coverFile.buffer)
-          .resize(500, 500, {
-            fit: 'cover',
-            withoutEnlargement: true
-          })
-          .webp({ quality: 80 })
-          .toBuffer();
+    if (req.files?.cover?.[0]) {
+      const coverFile = req.files.cover[0];
+      const originalCoverPath = coverFile.path;
 
-        const coverFileName = `${Date.now()}-${crypto.randomBytes(8).toString('hex')}.webp`;
-        coverUrl = await uploadFileToStorage(
-          webpBuffer,
-          coverFileName,
-          'image/webp'
-        );
+      // Convert image to WebP
+      const newCoverName = path.parse(coverFile.filename).name + '.webp';
+      const newCoverPath = path.join(uploadsDir, newCoverName);
+
+      try {
+        await sharp(originalCoverPath)
+          .webp({ quality: 80 })
+          .toFile(newCoverPath);
+
+        // Delete original file
+        fs.unlinkSync(originalCoverPath);
+
+        if (USE_CLOUD_STORAGE) {
+          coverUrl = await uploadToCloudStorage(newCoverPath, `images/${newCoverName}`, 'image/webp');
+          // Remove local file after upload
+          fs.unlinkSync(newCoverPath);
+        } else {
+          coverUrl = `/uploads/${newCoverName}`;
+        }
       } catch (convertError) {
-        console.error("Error processing cover image:", convertError);
-        // Fallback to original image
-        const coverFileName = `${Date.now()}-${crypto.randomBytes(8).toString('hex')}${path.extname(coverFile.originalname)}`;
-        coverUrl = await uploadFileToStorage(
-          coverFile.buffer,
-          coverFileName,
-          coverFile.mimetype
-        );
+        console.error("Error converting cover to WebP:", convertError);
+
+        if (USE_CLOUD_STORAGE) {
+          coverUrl = await uploadToCloudStorage(originalCoverPath, `images/${coverFile.filename}`, coverFile.mimetype);
+          fs.unlinkSync(originalCoverPath);
+        } else {
+          coverUrl = `/uploads/${coverFile.filename}`;
+        }
       }
     }
 
@@ -671,17 +642,14 @@ app.post("/beats", authenticateToken, upload.fields([{ name: "file" }, { name: "
       price: req.body.price || 100,
       featured: req.body.featured || false,
       description: req.body.description,
-      fileUrl: audioUrl,
-      coverUrl: coverUrl,
+      fileUrl: USE_CLOUD_STORAGE ? audioUrl : `/uploads/${audioFile.filename}`,
+      coverUrl: coverUrl || undefined,
+      storageType: STORAGE_TYPE
     });
 
     await beat.save();
 
-    // Convert Mongoose object to plain JS object
-    const beatObject = beat.toObject();
-    const responseBeat = addBaseUrlToBeats(beatObject);
-
-    res.status(201).json(responseBeat);
+    res.status(201).json(addBaseUrlToBeats(beat));
   } catch (e) {
     console.error("Error creating beat:", e);
     res.status(500).json({ message: "Failed to save beat", error: e.message });
@@ -725,15 +693,40 @@ app.delete("/beats/:id", authenticateToken, async (req, res) => {
       return res.status(400).json({ message: "Invalid beat ID" });
     }
 
-    const beat = await Beat.findByIdAndDelete(req.params.id);
+    const beat = await Beat.findById(req.params.id);
 
     if (!beat) {
       return res.status(404).json({ message: "Beat not found" });
     }
 
     // Delete associated files from storage
-    await deleteFileFromStorage(beat.fileUrl);
-    await deleteFileFromStorage(beat.coverUrl);
+    if (beat.storageType === 'cloud') {
+      // Delete from cloud storage
+      if (beat.fileUrl) {
+        await deleteFromCloudStorage(beat.fileUrl);
+      }
+      if (beat.coverUrl) {
+        await deleteFromCloudStorage(beat.coverUrl);
+      }
+    } else {
+      // Delete local files
+      if (beat.fileUrl) {
+        const filePath = path.join(__dirname, beat.fileUrl);
+        if (fs.existsSync(filePath)) {
+          fs.unlinkSync(filePath);
+        }
+      }
+
+      if (beat.coverUrl) {
+        const coverPath = path.join(__dirname, beat.coverUrl);
+        if (fs.existsSync(coverPath)) {
+          fs.unlinkSync(coverPath);
+        }
+      }
+    }
+
+    // Delete from database
+    await Beat.findByIdAndDelete(req.params.id);
 
     res.json({ message: "Beat deleted successfully" });
   } catch (e) {
@@ -792,8 +785,8 @@ app.get("/genres", async (req, res) => {
 // Get featured beats
 app.get("/beats/featured", async (req, res) => {
   try {
-    const beats = await Beat.find({ featured: true }).sort({ date: -1 }).limit(10);
-    res.json(addBaseUrlToBeats(beats));
+    const featuredBeats = await Beat.find({ featured: true }).sort({ date: -1 }).limit(5);
+    res.json(addBaseUrlToBeats(featuredBeats));
   } catch (e) {
     console.error("Error fetching featured beats:", e);
     res.status(500).json({ message: "Failed to fetch featured beats" });
@@ -833,31 +826,12 @@ app.use((req, res) => {
   res.status(404).json({ message: "Endpoint not found" });
 });
 
-// Graceful shutdown
-process.on('SIGTERM', () => {
-  console.log('SIGTERM received, shutting down gracefully');
-  server.close(() => {
-    console.log('Process terminated');
-    mongoose.connection.close();
-    process.exit(0);
-  });
-});
-
-process.on('SIGINT', () => {
-  console.log('SIGINT received, shutting down gracefully');
-  server.close(() => {
-    console.log('Process terminated');
-    mongoose.connection.close();
-    process.exit(0);
-  });
-});
-
 // Start server
-const server = app.listen(PORT, "0.0.0.0", () => {
+app.listen(PORT, "0.0.0.0", () => {
   console.log(`Server running on port ${PORT}`);
   console.log(`Environment: ${NODE_ENV}`);
   console.log(`Frontend URL: ${FRONTEND_URL}`);
   console.log(`Base URL: ${BASE_URL}`);
+  console.log(`Storage Type: ${STORAGE_TYPE}`);
   console.log(`Health check: http://0.0.0.0:${PORT}/health`);
-  console.log(`Storage: ${s3Client ? 'S3 (Yandex Cloud)' : 'Local'}`);
 });
