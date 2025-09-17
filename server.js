@@ -14,6 +14,7 @@ import helmet from "helmet";
 import compression from "compression";
 import crypto from "crypto";
 import sanitizeHtml from "sanitize-html";
+import cookieParser from "cookie-parser";
 
 dotenv.config();
 
@@ -25,38 +26,47 @@ const MONGO_URI = process.env.MONGO_URI || "mongodb://127.0.0.1:27017/beats";
 const JWT_SECRET = process.env.JWT_SECRET || crypto.randomBytes(64).toString('hex');
 const JWT_REFRESH_SECRET = process.env.JWT_REFRESH_SECRET || crypto.randomBytes(64).toString('hex');
 const BASE_URL = process.env.BASE_URL || `http://localhost:${PORT}`;
-const DEFAULT_ADMIN_PASSWORD = process.env.DEFAULT_ADMIN_PASSWORD || crypto.randomBytes(12).toString('hex');
+const FRONTEND_URL = process.env.FRONTEND_URL || "http://localhost:3000";
 const NODE_ENV = process.env.NODE_ENV || 'development';
 
 const app = express();
+
+// Cookie parser middleware
+app.use(cookieParser());
 
 // Security middleware
 app.use(helmet({
   contentSecurityPolicy: {
     directives: {
-      defaultSrc: ["'self'"],
-      scriptSrc: ["'self'"],
-      styleSrc: ["'self'"],
-      imgSrc: ["'self'", "data:"],
-      mediaSrc: ["'self'", "data:"],
-      connectSrc: ["'self'"],
-      fontSrc: ["'self'"],
+      defaultSrc: ["'self'", FRONTEND_URL],
+      scriptSrc: ["'self'", "'unsafe-inline'", FRONTEND_URL],
+      styleSrc: ["'self'", "'unsafe-inline'", FRONTEND_URL],
+      imgSrc: ["'self'", "data:", "blob:", FRONTEND_URL, BASE_URL],
+      mediaSrc: ["'self'", "data:", "blob:", FRONTEND_URL, BASE_URL],
+      connectSrc: ["'self'", FRONTEND_URL, BASE_URL],
+      fontSrc: ["'self'", FRONTEND_URL],
       objectSrc: ["'none'"],
       frameSrc: ["'none'"]
     },
   },
-  crossOriginResourcePolicy: { policy: "same-site" },
-  referrerPolicy: { policy: 'same-origin' }
+  crossOriginResourcePolicy: { policy: "cross-origin" },
+  crossOriginEmbedderPolicy: false,
+  referrerPolicy: { policy: 'strict-origin-when-cross-origin' }
 }));
 
 // Enhanced CORS configuration
 app.use(cors({
-  origin: NODE_ENV === 'production' ? process.env.FRONTEND_URL : "http://localhost:3000",
-  methods: ["GET", "POST", "PUT", "DELETE"],
-  credentials: true
+  origin: FRONTEND_URL,
+  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+  credentials: true,
+  allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With"]
 }));
 
+// Handle preflight requests
+app.options('*', cors());
+
 app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
 // Rate limiting
 const limiter = rateLimit({
@@ -164,34 +174,25 @@ async function createDefaultAdmin() {
     if (!admin) {
       console.log("Admin not found, creating new one...");
 
-      if (!DEFAULT_ADMIN_PASSWORD) {
-        console.error("DEFAULT_ADMIN_PASSWORD is not set!");
-        return;
-      }
+      // Generate a secure random password
+      const password = crypto.randomBytes(12).toString('hex');
+      const hashedPassword = await bcrypt.hash(password, 12);
 
-      const hashedPassword = await bcrypt.hash(DEFAULT_ADMIN_PASSWORD, 12);
       admin = new Admin({
         username: "admin",
         password: hashedPassword
       });
 
       await admin.save();
-      console.log(`Default admin created: admin / ${DEFAULT_ADMIN_PASSWORD}`);
+      console.log("Default admin created. Please check the logs for the password.");
+      console.log(`Username: admin`);
+      console.log(`Password: ${password}`);
+      console.log("Please change this password after first login!");
     } else {
-      console.log("Admin found, updating password...");
-
-      if (!DEFAULT_ADMIN_PASSWORD) {
-        console.error("DEFAULT_ADMIN_PASSWORD is not set!");
-        return;
-      }
-
-      const hashedPassword = await bcrypt.hash(DEFAULT_ADMIN_PASSWORD, 12);
-      admin.password = hashedPassword;
-      await admin.save();
-      console.log(`Admin password updated to: ${DEFAULT_ADMIN_PASSWORD}`);
+      console.log("Admin account already exists.");
     }
   } catch (error) {
-    console.error("Error creating/updating default admin:", error);
+    console.error("Error creating default admin:", error);
   }
 }
 
@@ -336,7 +337,8 @@ app.get("/csrf-token", (req, res) => {
   res.cookie('XSRF-TOKEN', csrfToken, {
     httpOnly: false,
     secure: NODE_ENV === 'production',
-    sameSite: 'strict'
+    sameSite: NODE_ENV === 'production' ? 'none' : 'lax',
+    domain: NODE_ENV === 'production' ? new URL(FRONTEND_URL).hostname : 'localhost'
   });
   res.json({ csrfToken });
 });
@@ -383,7 +385,8 @@ app.post("/admin/login", authLimiter, async (req, res) => {
     res.cookie('refreshToken', tokens.refreshToken, {
       httpOnly: true,
       secure: NODE_ENV === 'production',
-      sameSite: 'strict',
+      sameSite: NODE_ENV === 'production' ? 'none' : 'lax',
+      domain: NODE_ENV === 'production' ? new URL(FRONTEND_URL).hostname : 'localhost',
       maxAge: 7 * 24 * 60 * 60 * 1000 // 7 days
     });
 
@@ -432,7 +435,8 @@ app.post("/admin/refresh", async (req, res) => {
     res.cookie('refreshToken', tokens.refreshToken, {
       httpOnly: true,
       secure: NODE_ENV === 'production',
-      sameSite: 'strict',
+      sameSite: NODE_ENV === 'production' ? 'none' : 'lax',
+      domain: NODE_ENV === 'production' ? new URL(FRONTEND_URL).hostname : 'localhost',
       maxAge: 7 * 24 * 60 * 60 * 1000
     });
 
@@ -457,7 +461,11 @@ app.post("/admin/logout", authenticateToken, async (req, res) => {
     }
 
     // Clear refresh token cookie
-    res.clearCookie('refreshToken');
+    res.clearCookie('refreshToken', {
+      domain: NODE_ENV === 'production' ? new URL(FRONTEND_URL).hostname : 'localhost',
+      secure: NODE_ENV === 'production',
+      sameSite: NODE_ENV === 'production' ? 'none' : 'lax'
+    });
     res.json({ message: "Logged out successfully" });
   } catch (error) {
     console.error("Logout error:", error);
@@ -708,5 +716,7 @@ app.use((req, res) => {
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`Server running on port ${PORT}`);
   console.log(`Environment: ${NODE_ENV}`);
+  console.log(`Frontend URL: ${FRONTEND_URL}`);
+  console.log(`Base URL: ${BASE_URL}`);
   console.log(`Health check: http://0.0.0.0:${PORT}/health`);
 });
