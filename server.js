@@ -18,7 +18,9 @@ import cookieParser from "cookie-parser";
 import { S3Client, PutObjectCommand, DeleteObjectCommand, GetObjectCommand } from "@aws-sdk/client-s3";
 import { createReadStream } from "fs";
 import { uploadToCloudStorage, deleteFromCloudStorage, getCloudStorageUrl } from "./cloud-storage.js";
+import mongoosePaginate from 'mongoose-paginate-v2';
 
+mongoose.plugin(mongoosePaginate);
 dotenv.config();
 
 const __filename = fileURLToPath(import.meta.url);
@@ -58,7 +60,14 @@ app.use(helmet({
 
 // Enhanced CORS configuration
 app.use(cors({
-  origin: FRONTEND_URL,
+  origin: function(origin, callback) {
+    const allowedOrigins = [FRONTEND_URL];
+    if (!origin || allowedOrigins.indexOf(origin) !== -1) {
+      callback(null, true);
+    } else {
+      callback(new Error('Not allowed by CORS'));
+    }
+  },
   methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
   credentials: true,
   allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With", "X-CSRF-Token"]
@@ -550,7 +559,6 @@ app.get("/beats", async (req, res) => {
 
     const beats = await Beat.paginate(filter, options);
 
-    // Add base URL to beats
     const response = {
       ...beats,
       docs: addBaseUrlToBeats(beats.docs)
@@ -559,7 +567,10 @@ app.get("/beats", async (req, res) => {
     res.json(response);
   } catch (e) {
     console.error("Error fetching beats:", e);
-    res.status(500).json({ message: "Failed to fetch beats" });
+    res.status(500).json({
+      message: "Failed to fetch beats",
+      error: process.env.NODE_ENV === 'development' ? e.message : undefined
+    });
   }
 });
 
