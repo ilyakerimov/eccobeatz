@@ -11,6 +11,8 @@ import bcrypt from "bcryptjs";
 import sharp from "sharp";
 import rateLimit from "express-rate-limit";
 import helmet from "helmet";
+import compression from "compression";
+
 
 dotenv.config();
 
