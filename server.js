@@ -15,6 +15,10 @@ import compression from "compression";
 import crypto from "crypto";
 import sanitizeHtml from "sanitize-html";
 import cookieParser from "cookie-parser";
+import { S3Client, PutObjectCommand, DeleteObjectCommand, GetObjectCommand } from "@aws-sdk/client-s3";
+import { createReadStream } from "fs";
+import { Upload } from "@aws-sdk/lib-storage";
+import mime from "mime-types";
 
 dotenv.config();
 
@@ -29,7 +33,34 @@ const BASE_URL = process.env.BASE_URL || `http://localhost:${PORT}`;
 const FRONTEND_URL = process.env.FRONTEND_URL || "http://localhost:3000";
 const NODE_ENV = process.env.NODE_ENV || 'development';
 
+// Yandex Cloud S3 configuration
+const S3_ENDPOINT = process.env.S3_ENDPOINT || "https://storage.yandexcloud.net";
+const S3_BUCKET = process.env.S3_BUCKET;
+const S3_ACCESS_KEY = process.env.S3_ACCESS_KEY;
+const S3_SECRET_KEY = process.env.S3_SECRET_KEY;
+const S3_REGION = process.env.S3_REGION || "ru-central1";
+
+// Initialize S3 client if credentials are provided
+let s3Client = null;
+if (S3_ACCESS_KEY && S3_SECRET_KEY && S3_BUCKET) {
+  s3Client = new S3Client({
+    region: S3_REGION,
+    endpoint: S3_ENDPOINT,
+    credentials: {
+      accessKeyId: S3_ACCESS_KEY,
+      secretAccessKey: S3_SECRET_KEY,
+    },
+    forcePathStyle: true,
+  });
+  console.log("S3 storage configured");
+} else {
+  console.log("S3 storage not configured, using local storage");
+}
+
 const app = express();
+
+// Compression middleware
+app.use(compression());
 
 // Cookie parser middleware
 app.use(cookieParser());
@@ -41,9 +72,9 @@ app.use(helmet({
       defaultSrc: ["'self'", FRONTEND_URL],
       scriptSrc: ["'self'", "'unsafe-inline'", FRONTEND_URL],
       styleSrc: ["'self'", "'unsafe-inline'", FRONTEND_URL],
-      imgSrc: ["'self'", "data:", "blob:", FRONTEND_URL, BASE_URL],
-      mediaSrc: ["'self'", "data:", "blob:", FRONTEND_URL, BASE_URL],
-      connectSrc: ["'self'", FRONTEND_URL, BASE_URL],
+      imgSrc: ["'self'", "data:", "blob:", FRONTEND_URL, BASE_URL, S3_ENDPOINT],
+      mediaSrc: ["'self'", "data:", "blob:", FRONTEND_URL, BASE_URL, S3_ENDPOINT],
+      connectSrc: ["'self'", FRONTEND_URL, BASE_URL, S3_ENDPOINT],
       fontSrc: ["'self'", FRONTEND_URL],
       objectSrc: ["'none'"],
       frameSrc: ["'none'"]
@@ -54,7 +85,7 @@ app.use(helmet({
   referrerPolicy: { policy: 'strict-origin-when-cross-origin' }
 }));
 
-// Enhanced CORS configuration - добавлен X-CSRF-Token в allowedHeaders
+// Enhanced CORS configuration
 app.use(cors({
   origin: FRONTEND_URL,
   methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
@@ -116,27 +147,90 @@ app.use((req, res, next) => {
   }
 });
 
-// Ensure uploads directory exists
+// Ensure uploads directory exists for local storage
 const uploadsDir = path.join(__dirname, "uploads");
 if (!fs.existsSync(uploadsDir)) {
   fs.mkdirSync(uploadsDir, { recursive: true });
 }
 
-// Static file serving with proper headers
-app.use("/uploads", express.static(uploadsDir, {
-  setHeaders: (res, filePath) => {
-    if (filePath.endsWith('.mp3')) {
-      res.setHeader('Content-Type', 'audio/mpeg');
-      res.setHeader('Content-Disposition', 'inline');
-    } else if (filePath.endsWith('.webp')) {
-      res.setHeader('Content-Type', 'image/webp');
+// Static file serving with proper headers (for local storage)
+if (!s3Client) {
+  app.use("/uploads", express.static(uploadsDir, {
+    setHeaders: (res, filePath) => {
+      if (filePath.endsWith('.mp3')) {
+        res.setHeader('Content-Type', 'audio/mpeg');
+        res.setHeader('Content-Disposition', 'inline');
+        res.setHeader('Cache-Control', 'public, max-age=86400'); // 1 day cache for audio
+      } else if (filePath.endsWith('.webp')) {
+        res.setHeader('Content-Type', 'image/webp');
+        res.setHeader('Cache-Control', 'public, max-age=2592000'); // 30 days cache for images
+      }
     }
-  }
-}));
+  }));
+}
 
 // Helper function to validate MongoDB ObjectId
 const isValidObjectId = (id) => {
   return mongoose.Types.ObjectId.isValid(id);
+};
+
+// File storage functions
+const uploadFileToStorage = async (fileBuffer, fileName, mimeType) => {
+  if (s3Client) {
+    // Upload to Yandex Cloud S3
+    const key = `beats/${Date.now()}-${crypto.randomBytes(8).toString('hex')}-${fileName}`;
+
+    const uploadParams = {
+      Bucket: S3_BUCKET,
+      Key: key,
+      Body: fileBuffer,
+      ContentType: mimeType,
+      ACL: 'public-read'
+    };
+
+    try {
+      const parallelUploads3 = new Upload({
+        client: s3Client,
+        params: uploadParams,
+      });
+
+      await parallelUploads3.done();
+      return `${S3_ENDPOINT}/${S3_BUCKET}/${key}`;
+    } catch (error) {
+      console.error("S3 upload error:", error);
+      throw new Error("Failed to upload file to cloud storage");
+    }
+  } else {
+    // Local storage
+    const filePath = path.join(uploadsDir, fileName);
+    fs.writeFileSync(filePath, fileBuffer);
+    return `/uploads/${fileName}`;
+  }
+};
+
+const deleteFileFromStorage = async (fileUrl) => {
+  if (!fileUrl) return;
+
+  if (s3Client && fileUrl.includes(S3_ENDPOINT)) {
+    // Delete from S3
+    try {
+      const key = fileUrl.replace(`${S3_ENDPOINT}/${S3_BUCKET}/`, '');
+      const deleteParams = {
+        Bucket: S3_BUCKET,
+        Key: key,
+      };
+
+      await s3Client.send(new DeleteObjectCommand(deleteParams));
+    } catch (error) {
+      console.error("S3 delete error:", error);
+    }
+  } else if (fileUrl.startsWith('/uploads/')) {
+    // Delete from local storage
+    const filePath = path.join(__dirname, fileUrl);
+    if (fs.existsSync(filePath)) {
+      fs.unlinkSync(filePath);
+    }
+  }
 };
 
 // Models
@@ -210,15 +304,10 @@ mongoose.connect(MONGO_URI, {
   process.exit(1);
 });
 
-// Multer configuration
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, uploadsDir),
-  filename: (req, file, cb) =>
-    cb(null, Date.now() + "-" + crypto.randomBytes(8).toString('hex') + path.extname(file.originalname)),
-});
-
+// Multer configuration for memory storage
+const memoryStorage = multer.memoryStorage();
 const upload = multer({
-  storage,
+  storage: memoryStorage,
   fileFilter: (req, file, cb) => {
     if (file.fieldname === 'file') {
       if (file.mimetype.startsWith('audio/')) {
@@ -260,6 +349,11 @@ const generateTokens = (userId, username) => {
 
 // Middleware to add base URL to beats
 function addBaseUrlToBeats(beats) {
+  // For S3 storage, URLs are already absolute
+  if (s3Client) {
+    return beats;
+  }
+
   const convertBeat = (beat) => {
     const plainBeat = beat.toObject ? beat.toObject() : beat;
     return {
@@ -328,14 +422,18 @@ function authenticateToken(req, res, next) {
 
 // Health check endpoint
 app.get("/health", (req, res) => {
-  res.status(200).json({ status: "OK", message: "Server is running" });
+  res.status(200).json({
+    status: "OK",
+    message: "Server is running",
+    storage: s3Client ? "S3" : "local"
+  });
 });
 
-// CSRF token endpoint - обновлено для production
+// CSRF token endpoint
 app.get("/csrf-token", (req, res) => {
   const csrfToken = crypto.randomBytes(32).toString('hex');
 
-  // Установка куки с правильными настройками для production
+  // Set cookie with proper settings for production
   res.cookie('XSRF-TOKEN', csrfToken, {
     httpOnly: false,
     secure: NODE_ENV === 'production',
@@ -384,7 +482,7 @@ app.post("/admin/login", authLimiter, async (req, res) => {
     });
     await refreshTokenDoc.save();
 
-    // Set refresh token as HTTP-only cookie - обновлено для production
+    // Set refresh token as HTTP-only cookie
     res.cookie('refreshToken', tokens.refreshToken, {
       httpOnly: true,
       secure: NODE_ENV === 'production',
@@ -434,7 +532,7 @@ app.post("/admin/refresh", async (req, res) => {
     tokenDoc.expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
     await tokenDoc.save();
 
-    // Set new refresh token as HTTP-only cookie - обновлено для production
+    // Set new refresh token as HTTP-only cookie
     res.cookie('refreshToken', tokens.refreshToken, {
       httpOnly: true,
       secure: NODE_ENV === 'production',
@@ -463,7 +561,7 @@ app.post("/admin/logout", authenticateToken, async (req, res) => {
       await RefreshToken.deleteOne({ token: refreshToken });
     }
 
-    // Clear refresh token cookie - обновлено для production
+    // Clear refresh token cookie
     res.clearCookie('refreshToken', {
       domain: NODE_ENV === 'production' ? new URL(FRONTEND_URL).hostname : 'localhost',
       secure: NODE_ENV === 'production',
@@ -480,11 +578,15 @@ app.post("/admin/logout", authenticateToken, async (req, res) => {
 // Get all beats with genre filter
 app.get("/beats", async (req, res) => {
   try {
-    const { genre } = req.query;
+    const { genre, featured } = req.query;
     let filter = {};
 
     if (genre && genre !== "all") {
       filter.genre = new RegExp(`^${genre}$`, 'i');
+    }
+
+    if (featured === "true") {
+      filter.featured = true;
     }
 
     const beats = await Beat.find(filter).sort({ date: -1 });
@@ -520,31 +622,46 @@ app.post("/beats", authenticateToken, upload.fields([{ name: "file" }, { name: "
       return res.status(400).json({ message: "Audio file is required" });
     }
 
-    const fileName = req.files.file[0].filename;
-    let coverName = null;
+    const audioFile = req.files.file[0];
+    let coverFile = req.files?.cover?.[0];
+
+    // Upload audio file
+    const audioFileName = `${Date.now()}-${crypto.randomBytes(8).toString('hex')}${path.extname(audioFile.originalname)}`;
+    const audioUrl = await uploadFileToStorage(
+      audioFile.buffer,
+      audioFileName,
+      audioFile.mimetype
+    );
+
+    let coverUrl = null;
 
     // Process cover image if exists
-    if (req.files?.cover?.[0]) {
-      const coverFile = req.files.cover[0];
-      const originalCoverPath = coverFile.path;
-
-      // Create new filename with .webp extension
-      const newCoverName = path.parse(coverFile.filename).name + '.webp';
-      const newCoverPath = path.join(uploadsDir, newCoverName);
-
+    if (coverFile) {
       try {
-        // Convert image to WebP
-        await sharp(originalCoverPath)
+        // Convert image to WebP and resize
+        const webpBuffer = await sharp(coverFile.buffer)
+          .resize(500, 500, {
+            fit: 'cover',
+            withoutEnlargement: true
+          })
           .webp({ quality: 80 })
-          .toFile(newCoverPath);
+          .toBuffer();
 
-        // Delete original file
-        fs.unlinkSync(originalCoverPath);
-
-        coverName = newCoverName;
+        const coverFileName = `${Date.now()}-${crypto.randomBytes(8).toString('hex')}.webp`;
+        coverUrl = await uploadFileToStorage(
+          webpBuffer,
+          coverFileName,
+          'image/webp'
+        );
       } catch (convertError) {
-        console.error("Error converting cover to WebP:", convertError);
-        coverName = coverFile.filename;
+        console.error("Error processing cover image:", convertError);
+        // Fallback to original image
+        const coverFileName = `${Date.now()}-${crypto.randomBytes(8).toString('hex')}${path.extname(coverFile.originalname)}`;
+        coverUrl = await uploadFileToStorage(
+          coverFile.buffer,
+          coverFileName,
+          coverFile.mimetype
+        );
       }
     }
 
@@ -554,8 +671,8 @@ app.post("/beats", authenticateToken, upload.fields([{ name: "file" }, { name: "
       price: req.body.price || 100,
       featured: req.body.featured || false,
       description: req.body.description,
-      fileUrl: `/uploads/${fileName}`,
-      coverUrl: coverName ? `/uploads/${coverName}` : undefined,
+      fileUrl: audioUrl,
+      coverUrl: coverUrl,
     });
 
     await beat.save();
@@ -614,20 +731,9 @@ app.delete("/beats/:id", authenticateToken, async (req, res) => {
       return res.status(404).json({ message: "Beat not found" });
     }
 
-    // Delete associated files
-    if (beat.fileUrl) {
-      const filePath = path.join(__dirname, beat.fileUrl);
-      if (fs.existsSync(filePath)) {
-        fs.unlinkSync(filePath);
-      }
-    }
-
-    if (beat.coverUrl) {
-      const coverPath = path.join(__dirname, beat.coverUrl);
-      if (fs.existsSync(coverPath)) {
-        fs.unlinkSync(coverPath);
-      }
-    }
+    // Delete associated files from storage
+    await deleteFileFromStorage(beat.fileUrl);
+    await deleteFileFromStorage(beat.coverUrl);
 
     res.json({ message: "Beat deleted successfully" });
   } catch (e) {
@@ -676,10 +782,21 @@ app.post("/plays/:id", async (req, res) => {
 app.get("/genres", async (req, res) => {
   try {
     const genres = await Beat.distinct("genre");
-    res.json(["all", ...genres]);
+    res.json(["all", ...genres.sort()]);
   } catch (e) {
     console.error("Error fetching genres:", e);
     res.status(500).json({ message: "Failed to fetch genres" });
+  }
+});
+
+// Get featured beats
+app.get("/beats/featured", async (req, res) => {
+  try {
+    const beats = await Beat.find({ featured: true }).sort({ date: -1 }).limit(10);
+    res.json(addBaseUrlToBeats(beats));
+  } catch (e) {
+    console.error("Error fetching featured beats:", e);
+    res.status(500).json({ message: "Failed to fetch featured beats" });
   }
 });
 
@@ -716,11 +833,31 @@ app.use((req, res) => {
   res.status(404).json({ message: "Endpoint not found" });
 });
 
+// Graceful shutdown
+process.on('SIGTERM', () => {
+  console.log('SIGTERM received, shutting down gracefully');
+  server.close(() => {
+    console.log('Process terminated');
+    mongoose.connection.close();
+    process.exit(0);
+  });
+});
+
+process.on('SIGINT', () => {
+  console.log('SIGINT received, shutting down gracefully');
+  server.close(() => {
+    console.log('Process terminated');
+    mongoose.connection.close();
+    process.exit(0);
+  });
+});
+
 // Start server
-app.listen(PORT, "0.0.0.0", () => {
+const server = app.listen(PORT, "0.0.0.0", () => {
   console.log(`Server running on port ${PORT}`);
   console.log(`Environment: ${NODE_ENV}`);
   console.log(`Frontend URL: ${FRONTEND_URL}`);
   console.log(`Base URL: ${BASE_URL}`);
   console.log(`Health check: http://0.0.0.0:${PORT}/health`);
+  console.log(`Storage: ${s3Client ? 'S3 (Yandex Cloud)' : 'Local'}`);
 });
