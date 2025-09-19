@@ -190,6 +190,17 @@ const RefreshToken = mongoose.model("RefreshToken", new mongoose.Schema({
   createdAt: { type: Date, default: Date.now, expires: '7d' }
 }));
 
+const Purchase = mongoose.model("Purchase", new mongoose.Schema({
+  beatId: { type: mongoose.Schema.Types.ObjectId, ref: 'Beat', required: true },
+  email: { type: String, required: true },
+  format: { type: String, enum: ['wav', 'exclusive'], required: true },
+  license: { type: String, enum: ['basic', 'premium'], required: true },
+  amount: { type: Number, required: true },
+  paymentId: { type: String, required: true },
+  status: { type: String, enum: ['pending', 'completed', 'failed'], default: 'pending' },
+  createdAt: { type: Date, default: Date.now }
+}));
+
 // Create default admin if not exists
 async function createDefaultAdmin() {
   try {
@@ -801,6 +812,126 @@ app.get("/beats/featured", async (req, res) => {
   } catch (e) {
     console.error("Error fetching featured beats:", e);
     res.status(500).json({ message: "Failed to fetch featured beats" });
+  }
+});
+
+// Create payment endpoint
+app.post("/api/create-payment", async (req, res) => {
+  try {
+    const { beatId, email, format, license, amount } = req.body;
+
+    // Validate input
+    if (!isValidObjectId(beatId)) {
+      return res.status(400).json({ message: "Invalid beat ID" });
+    }
+
+    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      return res.status(400).json({ message: "Valid email is required" });
+    }
+
+    // Check if beat exists
+    const beat = await Beat.findById(beatId);
+    if (!beat) {
+      return res.status(404).json({ message: "Beat not found" });
+    }
+
+    // Generate a unique payment ID
+    const paymentId = `pay_${Date.now()}_${crypto.randomBytes(8).toString('hex')}`;
+
+    // Save purchase to database
+    const purchase = new Purchase({
+      beatId,
+      email,
+      format,
+      license,
+      amount,
+      paymentId,
+      status: 'pending'
+    });
+    await purchase.save();
+
+    // In a real implementation, you would integrate with YooKassa here
+    // For now, we'll return a mock response
+    const mockPaymentData = {
+      id: paymentId,
+      status: 'pending',
+      confirmation_url: `${BASE_URL}/api/mock-payment-success?paymentId=${paymentId}`,
+      amount: {
+        value: amount,
+        currency: 'RUB'
+      }
+    };
+
+    res.json(mockPaymentData);
+  } catch (error) {
+    console.error('Payment creation error:', error);
+    res.status(500).json({ message: 'Payment creation failed' });
+  }
+});
+
+// Mock payment success endpoint for testing
+app.get("/api/mock-payment-success", async (req, res) => {
+  try {
+    const { paymentId } = req.query;
+
+    // Find the purchase
+    const purchase = await Purchase.findOne({ paymentId });
+    if (!purchase) {
+      return res.status(404).json({ message: "Purchase not found" });
+    }
+
+    // Update purchase status
+    purchase.status = 'completed';
+    await purchase.save();
+
+    // Get beat info
+    const beat = await Beat.findById(purchase.beatId);
+
+    // In a real implementation, you would:
+    // 1. Generate a download link for the beat
+    // 2. Send an email to the customer with the download link
+    // 3. For exclusive purchases, send separate tracks
+
+    res.send(`
+      <html>
+        <head>
+          <title>Payment Successful</title>
+          <style>
+            body { font-family: Arial, sans-serif; text-align: center; padding: 50px; }
+            .success { color: green; font-size: 24px; }
+          </style>
+        </head>
+        <body>
+          <div class="success">✅ Payment Successful!</div>
+          <p>Thank you for your purchase of "${beat.title}".</p>
+          <p>An email with download instructions has been sent to ${purchase.email}.</p>
+          <p><a href="${FRONTEND_URL}">Return to the website</a></p>
+        </body>
+      </html>
+    `);
+  } catch (error) {
+    console.error('Mock payment error:', error);
+    res.status(500).send('Payment processing error');
+  }
+});
+
+// Get purchase history (admin only)
+app.get("/admin/purchases", authenticateToken, async (req, res) => {
+  try {
+    const { page = 1, limit = 20 } = req.query;
+
+    const options = {
+      page: parseInt(page),
+      limit: parseInt(limit),
+      sort: { createdAt: -1 },
+      populate: 'beatId'
+    };
+
+    const purchases = await Purchase.paginate({}, options);
+    res.json(purchases);
+  } catch (error) {
+    console.error('Error fetching purchases:', error);
+    res.status(500).json({ message: 'Failed to fetch purchases' });
   }
 });
 
