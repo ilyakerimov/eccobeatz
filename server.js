@@ -172,7 +172,8 @@ const Beat = mongoose.model("Beat", new mongoose.Schema({
   price: { type: Number, default: 100, min: 0, max: 10000 },
   featured: { type: Boolean, default: false },
   description: { type: String, maxlength: 500 },
-  storageType: { type: String, default: STORAGE_TYPE, enum: ['local', 'cloud'] }
+  storageType: { type: String, default: STORAGE_TYPE, enum: ['local', 'cloud'] },
+  order: { type: Number, default: 0 } // Новое поле для порядка сортировки
 }));
 
 const Admin = mongoose.model("Admin", new mongoose.Schema({
@@ -565,7 +566,7 @@ app.get("/beats", async (req, res) => {
     const options = {
       page: parseInt(page),
       limit: parseInt(limit),
-      sort: { date: -1 }
+      sort: { order: -1, date: -1 } // Сначала сортируем по order, потом по дате
     };
 
     const beats = await Beat.paginate(filter, options);
@@ -658,6 +659,10 @@ app.post("/beats", authenticateToken, upload.fields([{ name: "file" }, { name: "
       }
     }
 
+    // Find max order to set the new beat at the top
+    const maxOrderBeat = await Beat.findOne().sort({ order: -1 });
+    const newOrder = maxOrderBeat ? maxOrderBeat.order + 1 : 0;
+
     const beat = new Beat({
       title: req.body.title,
       genre: req.body.genre,
@@ -666,7 +671,8 @@ app.post("/beats", authenticateToken, upload.fields([{ name: "file" }, { name: "
       description: req.body.description,
       fileUrl: USE_CLOUD_STORAGE ? audioUrl : `/uploads/${audioFile.filename}`,
       coverUrl: coverUrl || undefined,
-      storageType: STORAGE_TYPE
+      storageType: STORAGE_TYPE,
+      order: newOrder // Set the new beat at the top
     });
 
     await beat.save();
@@ -705,6 +711,51 @@ app.put("/beats/:id", authenticateToken, validateBeatInput, async (req, res) => 
   } catch (e) {
     console.error("Error updating beat:", e);
     res.status(500).json({ message: "Failed to update beat" });
+  }
+});
+
+// Move beat up or down in order
+app.post("/beats/:id/move", authenticateToken, async (req, res) => {
+  try {
+    if (!isValidObjectId(req.params.id)) {
+      return res.status(400).json({ message: "Invalid beat ID" });
+    }
+
+    const { direction } = req.body;
+    if (!direction || (direction !== 'up' && direction !== 'down')) {
+      return res.status(400).json({ message: "Direction must be 'up' or 'down'" });
+    }
+
+    const beat = await Beat.findById(req.params.id);
+    if (!beat) {
+      return res.status(404).json({ message: "Beat not found" });
+    }
+
+    let targetBeat;
+    if (direction === 'up') {
+      // Find the beat with the next higher order
+      targetBeat = await Beat.findOne({ order: { $gt: beat.order } }).sort({ order: 1 });
+    } else {
+      // Find the beat with the next lower order
+      targetBeat = await Beat.findOne({ order: { $lt: beat.order } }).sort({ order: -1 });
+    }
+
+    if (!targetBeat) {
+      return res.status(400).json({ message: `Cannot move beat ${direction}` });
+    }
+
+    // Swap orders
+    const tempOrder = beat.order;
+    beat.order = targetBeat.order;
+    targetBeat.order = tempOrder;
+
+    await beat.save();
+    await targetBeat.save();
+
+    res.json({ message: "Beat moved successfully" });
+  } catch (e) {
+    console.error("Error moving beat:", e);
+    res.status(500).json({ message: "Failed to move beat" });
   }
 });
 
@@ -807,7 +858,7 @@ app.get("/genres", async (req, res) => {
 // Get featured beats
 app.get("/beats/featured", async (req, res) => {
   try {
-    const featuredBeats = await Beat.find({ featured: true }).sort({ date: -1 }).limit(5);
+    const featuredBeats = await Beat.find({ featured: true }).sort({ order: -1, date: -1 }).limit(5);
     res.json(addBaseUrlToBeats(featuredBeats));
   } catch (e) {
     console.error("Error fetching featured beats:", e);
