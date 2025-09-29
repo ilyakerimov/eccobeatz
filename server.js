@@ -61,10 +61,21 @@ app.use(helmet({
 // Enhanced CORS configuration
 app.use(cors({
   origin: function(origin, callback) {
-    const allowedOrigins = [FRONTEND_URL];
-    if (!origin || allowedOrigins.indexOf(origin) !== -1) {
+    // Разрешаем запросы без origin (например, от мобильных приложений или Postman)
+    if (!origin) return callback(null, true);
+
+    const allowedOrigins = [
+      FRONTEND_URL,
+      'http://localhost:3000',
+      'http://127.0.0.1:3000',
+      'http://localhost:3001',
+      'http://127.0.0.1:3001'
+    ];
+
+    if (allowedOrigins.indexOf(origin) !== -1) {
       callback(null, true);
     } else {
+      console.log('CORS blocked for origin:', origin);
       callback(new Error('Not allowed by CORS'));
     }
   },
