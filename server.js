@@ -38,16 +38,16 @@ const STORAGE_TYPE = USE_CLOUD_STORAGE ? 'cloud' : 'local';
 
 const app = express();
 
-// Security middleware
+// Security middleware with cache control
 app.use(helmet({
   contentSecurityPolicy: {
     directives: {
       defaultSrc: ["'self'", FRONTEND_URL],
       scriptSrc: ["'self'", "'unsafe-inline'", FRONTEND_URL],
       styleSrc: ["'self'", "'unsafe-inline'", FRONTEND_URL],
-      imgSrc: ["'self'", "data:", "blob:", FRONTEND_URL, BASE_URL],
-      mediaSrc: ["'self'", "data:", "blob:", FRONTEND_URL, BASE_URL],
-      connectSrc: ["'self'", FRONTEND_URL, BASE_URL],
+      imgSrc: ["'self'", "data:", "blob:", FRONTEND_URL, BASE_URL, "hb.ru-msk.vkcs.cloud"],
+      mediaSrc: ["'self'", "data:", "blob:", FRONTEND_URL, BASE_URL, "hb.ru-msk.vkcs.cloud"],
+      connectSrc: ["'self'", FRONTEND_URL, BASE_URL, "hb.ru-msk.vkcs.cloud"],
       fontSrc: ["'self'", FRONTEND_URL],
       objectSrc: ["'none'"],
       frameSrc: ["'none'"]
@@ -61,21 +61,10 @@ app.use(helmet({
 // Enhanced CORS configuration
 app.use(cors({
   origin: function(origin, callback) {
-    // Разрешаем запросы без origin (например, от мобильных приложений или Postman)
-    if (!origin) return callback(null, true);
-
-    const allowedOrigins = [
-      FRONTEND_URL,
-      'http://localhost:3000',
-      'http://127.0.0.1:3000',
-      'http://localhost:3001',
-      'http://127.0.0.1:3001'
-    ];
-
-    if (allowedOrigins.indexOf(origin) !== -1) {
+    const allowedOrigins = [FRONTEND_URL];
+    if (!origin || allowedOrigins.indexOf(origin) !== -1) {
       callback(null, true);
     } else {
-      console.log('CORS blocked for origin:', origin);
       callback(new Error('Not allowed by CORS'));
     }
   },
@@ -109,6 +98,35 @@ const authLimiter = rateLimit({
   message: 'Too many login attempts, please try again later.'
 });
 app.use("/admin/login", authLimiter);
+
+// Cache control middleware for static files
+const setCacheHeaders = (res, path) => {
+  const ext = path.extname(path);
+
+  // Different cache times for different file types
+  if (ext === '.js' || ext === '.css') {
+    // JavaScript and CSS - 1 year for production, no cache for development
+    res.setHeader('Cache-Control', NODE_ENV === 'production'
+      ? 'public, max-age=31536000, immutable'
+      : 'no-cache, no-store, must-revalidate'
+    );
+  } else if (ext === '.webp' || ext === '.jpg' || ext === '.jpeg' || ext === '.png') {
+    // Images - 1 year in production
+    res.setHeader('Cache-Control', NODE_ENV === 'production'
+      ? 'public, max-age=31536000, immutable'
+      : 'public, max-age=3600'
+    );
+  } else if (ext === '.mp3' || ext === '.wav') {
+    // Audio files - 1 month
+    res.setHeader('Cache-Control', 'public, max-age=2592000');
+  } else {
+    // Default - 1 hour
+    res.setHeader('Cache-Control', 'public, max-age=3600');
+  }
+
+  // Set ETag for cache validation
+  res.setHeader('ETag', crypto.createHash('md5').update(path + fs.statSync(path).mtime).digest('hex'));
+};
 
 // Logging middleware
 app.use((req, res, next) => {
@@ -152,10 +170,12 @@ if (!fs.existsSync(uploadsDir)) {
   fs.mkdirSync(uploadsDir, { recursive: true });
 }
 
-// Static file serving with proper headers
+// Static file serving with proper cache headers
 if (!USE_CLOUD_STORAGE) {
   app.use("/uploads", express.static(uploadsDir, {
     setHeaders: (res, filePath) => {
+      setCacheHeaders(res, filePath);
+
       if (filePath.endsWith('.mp3')) {
         res.setHeader('Content-Type', 'audio/mpeg');
         res.setHeader('Content-Disposition', 'inline');
@@ -163,6 +183,14 @@ if (!USE_CLOUD_STORAGE) {
         res.setHeader('Content-Type', 'image/webp');
       }
     }
+  }));
+}
+
+// Serve static files from build directory (if exists) with cache headers
+const buildPath = path.join(__dirname, 'build');
+if (fs.existsSync(buildPath)) {
+  app.use(express.static(buildPath, {
+    setHeaders: setCacheHeaders
   }));
 }
 
@@ -184,7 +212,7 @@ const Beat = mongoose.model("Beat", new mongoose.Schema({
   featured: { type: Boolean, default: false },
   description: { type: String, maxlength: 500 },
   storageType: { type: String, default: STORAGE_TYPE, enum: ['local', 'cloud'] },
-  order: { type: Number, default: 0 } // Новое поле для порядка сортировки
+  order: { type: Number, default: 0 }
 }));
 
 const Admin = mongoose.model("Admin", new mongoose.Schema({
@@ -577,7 +605,7 @@ app.get("/beats", async (req, res) => {
     const options = {
       page: parseInt(page),
       limit: parseInt(limit),
-      sort: { order: -1, date: -1 } // Сначала сортируем по order, потом по дате
+      sort: { order: -1, date: -1 }
     };
 
     const beats = await Beat.paginate(filter, options);
@@ -587,6 +615,8 @@ app.get("/beats", async (req, res) => {
       docs: addBaseUrlToBeats(beats.docs)
     };
 
+    // Set cache headers for beats API
+    res.setHeader('Cache-Control', 'public, max-age=300'); // 5 minutes for API data
     res.json(response);
   } catch (e) {
     console.error("Error fetching beats:", e);
@@ -608,6 +638,8 @@ app.get("/beats/:id", async (req, res) => {
     if (!beat) {
       return res.status(404).json({ message: "Beat not found" });
     }
+
+    res.setHeader('Cache-Control', 'public, max-age=300'); // 5 minutes
     res.json(addBaseUrlToBeats(beat));
   } catch (e) {
     console.error("Error fetching beat:", e);
@@ -683,7 +715,7 @@ app.post("/beats", authenticateToken, upload.fields([{ name: "file" }, { name: "
       fileUrl: USE_CLOUD_STORAGE ? audioUrl : `/uploads/${audioFile.filename}`,
       coverUrl: coverUrl || undefined,
       storageType: STORAGE_TYPE,
-      order: newOrder // Set the new beat at the top
+      order: newOrder
     });
 
     await beat.save();
@@ -859,6 +891,9 @@ app.post("/plays/:id", async (req, res) => {
 app.get("/genres", async (req, res) => {
   try {
     const genres = await Beat.distinct("genre");
+
+    // Set longer cache for genres as they don't change often
+    res.setHeader('Cache-Control', 'public, max-age=3600'); // 1 hour
     res.json(["all", ...genres.sort()]);
   } catch (e) {
     console.error("Error fetching genres:", e);
@@ -870,6 +905,9 @@ app.get("/genres", async (req, res) => {
 app.get("/beats/featured", async (req, res) => {
   try {
     const featuredBeats = await Beat.find({ featured: true }).sort({ order: -1, date: -1 }).limit(5);
+
+    // Set cache for featured beats
+    res.setHeader('Cache-Control', 'public, max-age=600'); // 10 minutes
     res.json(addBaseUrlToBeats(featuredBeats));
   } catch (e) {
     console.error("Error fetching featured beats:", e);
@@ -949,11 +987,6 @@ app.get("/api/mock-payment-success", async (req, res) => {
     // Get beat info
     const beat = await Beat.findById(purchase.beatId);
 
-    // In a real implementation, you would:
-    // 1. Generate a download link for the beat
-    // 2. Send an email to the customer with the download link
-    // 3. For exclusive purchases, send separate tracks
-
     res.send(`
       <html>
         <head>
@@ -996,6 +1029,13 @@ app.get("/admin/purchases", authenticateToken, async (req, res) => {
     res.status(500).json({ message: 'Failed to fetch purchases' });
   }
 });
+
+// Serve React app for all other routes (if build directory exists)
+if (fs.existsSync(buildPath)) {
+  app.get('*', (req, res) => {
+    res.sendFile(path.join(buildPath, 'index.html'));
+  });
+}
 
 // Error handling middleware
 app.use((error, req, res, next) => {
