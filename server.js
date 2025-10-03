@@ -1010,7 +1010,7 @@ app.get("/api/mock-payment-success", async (req, res) => {
   }
 });
 
-// Get purchase history (admin only)
+// Админ Гей
 app.get("/admin/purchases", authenticateToken, async (req, res) => {
   try {
     const { page = 1, limit = 20 } = req.query;
@@ -1065,12 +1065,12 @@ app.use((error, req, res, next) => {
   }
 });
 
-// 404 handler
+// 404 ловим
 app.use((req, res) => {
   res.status(404).json({ message: "Endpoint not found" });
 });
 
-// Start server
+
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`Server running on port ${PORT}`);
   console.log(`Environment: ${NODE_ENV}`);
