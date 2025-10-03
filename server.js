@@ -588,10 +588,10 @@ app.post("/admin/logout", authenticateToken, async (req, res) => {
   }
 });
 
-// Get all beats with genre filter
+// Get all beats with genre filter - ИЗМЕНЕНО: увеличен лимит до 1000
 app.get("/beats", async (req, res) => {
   try {
-    const { genre, page = 1, limit = 10, featured } = req.query;
+    const { genre, page = 1, limit = 1000, featured } = req.query; // Изменено с 10 на 1000
     let filter = {};
 
     if (genre && genre !== "all") {
@@ -1010,7 +1010,7 @@ app.get("/api/mock-payment-success", async (req, res) => {
   }
 });
 
-// Админ Гей
+// Админ панель - покупки
 app.get("/admin/purchases", authenticateToken, async (req, res) => {
   try {
     const { page = 1, limit = 20 } = req.query;
@@ -1065,11 +1065,10 @@ app.use((error, req, res, next) => {
   }
 });
 
-// 404 ловим
+// 404 handler
 app.use((req, res) => {
   res.status(404).json({ message: "Endpoint not found" });
 });
-
 
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`Server running on port ${PORT}`);
