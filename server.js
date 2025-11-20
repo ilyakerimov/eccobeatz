@@ -15,9 +15,7 @@ import compression from "compression";
 import crypto from "crypto";
 import sanitizeHtml from "sanitize-html";
 import cookieParser from "cookie-parser";
-import { S3Client, PutObjectCommand, DeleteObjectCommand, GetObjectCommand } from "@aws-sdk/client-s3";
-import { createReadStream } from "fs";
-import { uploadToCloudStorage, deleteFromCloudStorage, getCloudStorageUrl } from "./cloud-storage.js";
+import http from "http";
 import mongoosePaginate from 'mongoose-paginate-v2';
 
 mongoose.plugin(mongoosePaginate);
@@ -38,39 +36,32 @@ const STORAGE_TYPE = USE_CLOUD_STORAGE ? 'cloud' : 'local';
 
 const app = express();
 
-// Security middleware with cache control
+// Security middleware with cache control - упрощено для HTTP
 app.use(helmet({
-  contentSecurityPolicy: {
-    directives: {
-      defaultSrc: ["'self'", FRONTEND_URL],
-      scriptSrc: ["'self'", "'unsafe-inline'", FRONTEND_URL],
-      styleSrc: ["'self'", "'unsafe-inline'", FRONTEND_URL],
-      imgSrc: ["'self'", "data:", "blob:", FRONTEND_URL, BASE_URL, "hb.ru-msk.vkcs.cloud"],
-      mediaSrc: ["'self'", "data:", "blob:", FRONTEND_URL, BASE_URL, "hb.ru-msk.vkcs.cloud"],
-      connectSrc: ["'self'", FRONTEND_URL, BASE_URL, "hb.ru-msk.vkcs.cloud"],
-      fontSrc: ["'self'", FRONTEND_URL],
-      objectSrc: ["'none'"],
-      frameSrc: ["'none'"]
-    },
-  },
+  contentSecurityPolicy: false, // Отключаем CSP для упрощения
   crossOriginResourcePolicy: { policy: "cross-origin" },
   crossOriginEmbedderPolicy: false,
   referrerPolicy: { policy: 'strict-origin-when-cross-origin' }
 }));
 
-// Enhanced CORS configuration
+// Enhanced CORS configuration - упрощено для работы с HTTP
 app.use(cors({
   origin: function(origin, callback) {
-    const allowedOrigins = [FRONTEND_URL];
-    if (!origin || allowedOrigins.indexOf(origin) !== -1) {
+    // Разрешаем все origins в development, в production только FRONTEND_URL
+    if (NODE_ENV === 'development') {
       callback(null, true);
     } else {
-      callback(new Error('Not allowed by CORS'));
+      const allowedOrigins = [FRONTEND_URL];
+      if (!origin || allowedOrigins.indexOf(origin) !== -1) {
+        callback(null, true);
+      } else {
+        callback(new Error('Not allowed by CORS'));
+      }
     }
   },
   methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
   credentials: true,
-  allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With", "X-CSRF-Token"]
+  allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With"]
 }));
 
 // Handle preflight requests
@@ -84,7 +75,7 @@ app.use(cookieParser());
 // Rate limiting
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 100,
+  max: 1000, // Увеличено для production
   message: 'Too many requests from this IP',
   standardHeaders: true,
   legacyHeaders: false,
@@ -94,43 +85,36 @@ app.use(limiter);
 // Stricter limiting for auth endpoints
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 5,
+  max: 10, // Увеличено с 5 до 10
   message: 'Too many login attempts, please try again later.'
 });
 app.use("/admin/login", authLimiter);
 
 // Cache control middleware for static files
-const setCacheHeaders = (res, path) => {
-  const ext = path.extname(path);
+const setCacheHeaders = (res, filePath) => {
+  const ext = path.extname(filePath);
 
   // Different cache times for different file types
   if (ext === '.js' || ext === '.css') {
-    // JavaScript and CSS - 1 year for production, no cache for development
     res.setHeader('Cache-Control', NODE_ENV === 'production'
       ? 'public, max-age=31536000, immutable'
       : 'no-cache, no-store, must-revalidate'
     );
   } else if (ext === '.webp' || ext === '.jpg' || ext === '.jpeg' || ext === '.png') {
-    // Images - 1 year in production
     res.setHeader('Cache-Control', NODE_ENV === 'production'
       ? 'public, max-age=31536000, immutable'
       : 'public, max-age=3600'
     );
   } else if (ext === '.mp3' || ext === '.wav') {
-    // Audio files - 1 month
     res.setHeader('Cache-Control', 'public, max-age=2592000');
   } else {
-    // Default - 1 hour
     res.setHeader('Cache-Control', 'public, max-age=3600');
   }
-
-  // Set ETag for cache validation
-  res.setHeader('ETag', crypto.createHash('md5').update(path + fs.statSync(path).mtime).digest('hex'));
 };
 
 // Logging middleware
 app.use((req, res, next) => {
-  console.log(`${new Date().toISOString()} - ${req.method} ${req.path} - ${req.ip} - ${req.get('User-Agent')}`);
+  console.log(`${new Date().toISOString()} - ${req.method} ${req.path} - ${req.ip}`);
   next();
 });
 
@@ -343,18 +327,17 @@ function addBaseUrlToBeats(beats) {
 
     // Use cloud storage URL if file is stored in cloud
     if (plainBeat.storageType === 'cloud') {
-      return {
-        ...plainBeat,
-        fileUrl: plainBeat.fileUrl ? getCloudStorageUrl(plainBeat.fileUrl) : null,
-        coverUrl: plainBeat.coverUrl ? getCloudStorageUrl(plainBeat.coverUrl) : null
-      };
+      // Для облачного хранилища возвращаем URL как есть (они уже абсолютные)
+      return plainBeat;
     }
 
-    // Use local storage URL
+    // Для локального хранилища формируем правильный URL
+    const baseUrl = BASE_URL.replace(/\/$/, ''); // Убираем trailing slash если есть
+
     return {
       ...plainBeat,
-      fileUrl: plainBeat.fileUrl ? `${BASE_URL}${plainBeat.fileUrl}` : null,
-      coverUrl: plainBeat.coverUrl ? `${BASE_URL}${plainBeat.coverUrl}` : null
+      fileUrl: plainBeat.fileUrl ? `${baseUrl}${plainBeat.fileUrl.startsWith('/') ? '' : '/'}${plainBeat.fileUrl}` : null,
+      coverUrl: plainBeat.coverUrl ? `${baseUrl}${plainBeat.coverUrl.startsWith('/') ? '' : '/'}${plainBeat.coverUrl}` : null
     };
   };
 
@@ -421,7 +404,8 @@ app.get("/health", (req, res) => {
     status: "OK",
     message: "Server is running",
     storage: STORAGE_TYPE,
-    environment: NODE_ENV
+    environment: NODE_ENV,
+    protocol: "http"
   });
 });
 
@@ -431,9 +415,8 @@ app.get("/csrf-token", (req, res) => {
 
   res.cookie('XSRF-TOKEN', csrfToken, {
     httpOnly: false,
-    secure: NODE_ENV === 'production',
-    sameSite: NODE_ENV === 'production' ? 'none' : 'lax',
-    domain: NODE_ENV === 'production' ? new URL(FRONTEND_URL).hostname : 'localhost'
+    secure: false, // Всегда false для HTTP
+    sameSite: 'lax',
   });
 
   res.json({ csrfToken });
@@ -498,9 +481,8 @@ app.post("/admin/login", authLimiter, async (req, res) => {
     // Set refresh token as HTTP-only cookie
     res.cookie('refreshToken', tokens.refreshToken, {
       httpOnly: true,
-      secure: NODE_ENV === 'production',
-      sameSite: NODE_ENV === 'production' ? 'none' : 'lax',
-      domain: NODE_ENV === 'production' ? new URL(FRONTEND_URL).hostname : 'localhost',
+      secure: false, // Всегда false для HTTP
+      sameSite: 'lax',
       maxAge: 7 * 24 * 60 * 60 * 1000 // 7 days
     });
 
@@ -548,9 +530,8 @@ app.post("/admin/refresh", async (req, res) => {
     // Set new refresh token as HTTP-only cookie
     res.cookie('refreshToken', tokens.refreshToken, {
       httpOnly: true,
-      secure: NODE_ENV === 'production',
-      sameSite: NODE_ENV === 'production' ? 'none' : 'lax',
-      domain: NODE_ENV === 'production' ? new URL(FRONTEND_URL).hostname : 'localhost',
+      secure: false, // Всегда false для HTTP
+      sameSite: 'lax',
       maxAge: 7 * 24 * 60 * 60 * 1000
     });
 
@@ -576,9 +557,8 @@ app.post("/admin/logout", authenticateToken, async (req, res) => {
 
     // Clear refresh token cookie
     res.clearCookie('refreshToken', {
-      domain: NODE_ENV === 'production' ? new URL(FRONTEND_URL).hostname : 'localhost',
-      secure: NODE_ENV === 'production',
-      sameSite: NODE_ENV === 'production' ? 'none' : 'lax'
+      secure: false,
+      sameSite: 'lax'
     });
 
     res.json({ message: "Logged out successfully" });
@@ -588,10 +568,10 @@ app.post("/admin/logout", authenticateToken, async (req, res) => {
   }
 });
 
-// Get all beats with genre filter - ИЗМЕНЕНО: увеличен лимит до 1000
+// Get all beats with genre filter - исправлено: правильная пагинация
 app.get("/beats", async (req, res) => {
   try {
-    const { genre, page = 1, limit = 1000, featured } = req.query; // Изменено с 10 на 1000
+    const { genre, page = 1, limit = 1000, featured } = req.query;
     let filter = {};
 
     if (genre && genre !== "all") {
@@ -616,7 +596,7 @@ app.get("/beats", async (req, res) => {
     };
 
     // Set cache headers for beats API
-    res.setHeader('Cache-Control', 'public, max-age=300'); // 5 minutes for API data
+    res.setHeader('Cache-Control', 'public, max-age=300');
     res.json(response);
   } catch (e) {
     console.error("Error fetching beats:", e);
@@ -639,7 +619,7 @@ app.get("/beats/:id", async (req, res) => {
       return res.status(404).json({ message: "Beat not found" });
     }
 
-    res.setHeader('Cache-Control', 'public, max-age=300'); // 5 minutes
+    res.setHeader('Cache-Control', 'public, max-age=300');
     res.json(addBaseUrlToBeats(beat));
   } catch (e) {
     console.error("Error fetching beat:", e);
@@ -647,7 +627,7 @@ app.get("/beats/:id", async (req, res) => {
   }
 });
 
-// Create new beat (admin only)
+// Create new beat (admin only) - исправлено: убрана зависимость от cloud-storage
 app.post("/beats", authenticateToken, upload.fields([{ name: "file" }, { name: "cover" }]), validateBeatInput, async (req, res) => {
   try {
     if (!req.files?.file?.[0]) {
@@ -659,9 +639,9 @@ app.post("/beats", authenticateToken, upload.fields([{ name: "file" }, { name: "
 
     // Process audio file
     if (USE_CLOUD_STORAGE) {
-      audioUrl = await uploadToCloudStorage(audioFile.path, `audio/${audioFile.filename}`, audioFile.mimetype);
-      // Remove local file after upload
-      fs.unlinkSync(audioFile.path);
+      // Для облачного хранилища - заглушка, нужно реализовать отдельно
+      audioUrl = `/uploads/${audioFile.filename}`;
+      console.warn("Cloud storage not implemented, using local storage");
     } else {
       audioUrl = `/uploads/${audioFile.filename}`;
     }
@@ -684,9 +664,8 @@ app.post("/beats", authenticateToken, upload.fields([{ name: "file" }, { name: "
         fs.unlinkSync(originalCoverPath);
 
         if (USE_CLOUD_STORAGE) {
-          coverUrl = await uploadToCloudStorage(newCoverPath, `images/${newCoverName}`, 'image/webp');
-          // Remove local file after upload
-          fs.unlinkSync(newCoverPath);
+          coverUrl = `/uploads/${newCoverName}`;
+          console.warn("Cloud storage not implemented, using local storage");
         } else {
           coverUrl = `/uploads/${newCoverName}`;
         }
@@ -694,8 +673,7 @@ app.post("/beats", authenticateToken, upload.fields([{ name: "file" }, { name: "
         console.error("Error converting cover to WebP:", convertError);
 
         if (USE_CLOUD_STORAGE) {
-          coverUrl = await uploadToCloudStorage(originalCoverPath, `images/${coverFile.filename}`, coverFile.mimetype);
-          fs.unlinkSync(originalCoverPath);
+          coverUrl = `/uploads/${coverFile.filename}`;
         } else {
           coverUrl = `/uploads/${coverFile.filename}`;
         }
@@ -712,7 +690,7 @@ app.post("/beats", authenticateToken, upload.fields([{ name: "file" }, { name: "
       price: req.body.price || 100,
       featured: req.body.featured || false,
       description: req.body.description,
-      fileUrl: USE_CLOUD_STORAGE ? audioUrl : `/uploads/${audioFile.filename}`,
+      fileUrl: audioUrl,
       coverUrl: coverUrl || undefined,
       storageType: STORAGE_TYPE,
       order: newOrder
@@ -723,6 +701,16 @@ app.post("/beats", authenticateToken, upload.fields([{ name: "file" }, { name: "
     res.status(201).json(addBaseUrlToBeats(beat));
   } catch (e) {
     console.error("Error creating beat:", e);
+
+    // Clean up uploaded files in case of error
+    if (req.files) {
+      Object.values(req.files).flat().forEach(file => {
+        if (fs.existsSync(file.path)) {
+          fs.unlinkSync(file.path);
+        }
+      });
+    }
+
     res.status(500).json({ message: "Failed to save beat", error: e.message });
   }
 });
@@ -802,7 +790,7 @@ app.post("/beats/:id/move", authenticateToken, async (req, res) => {
   }
 });
 
-// Delete beat (admin only)
+// Delete beat (admin only) - исправлено: безопасное удаление файлов
 app.delete("/beats/:id", authenticateToken, async (req, res) => {
   try {
     if (!isValidObjectId(req.params.id)) {
@@ -817,25 +805,20 @@ app.delete("/beats/:id", authenticateToken, async (req, res) => {
 
     // Delete associated files from storage
     if (beat.storageType === 'cloud') {
-      // Delete from cloud storage
-      if (beat.fileUrl) {
-        await deleteFromCloudStorage(beat.fileUrl);
-      }
-      if (beat.coverUrl) {
-        await deleteFromCloudStorage(beat.coverUrl);
-      }
+      // Для облачного хранилища - заглушка
+      console.warn("Cloud storage deletion not implemented");
     } else {
-      // Delete local files
+      // Delete local files безопасно
       if (beat.fileUrl) {
         const filePath = path.join(__dirname, beat.fileUrl);
-        if (fs.existsSync(filePath)) {
+        if (fs.existsSync(filePath) && filePath.startsWith(path.join(__dirname, 'uploads'))) {
           fs.unlinkSync(filePath);
         }
       }
 
       if (beat.coverUrl) {
         const coverPath = path.join(__dirname, beat.coverUrl);
-        if (fs.existsSync(coverPath)) {
+        if (fs.existsSync(coverPath) && coverPath.startsWith(path.join(__dirname, 'uploads'))) {
           fs.unlinkSync(coverPath);
         }
       }
@@ -893,7 +876,7 @@ app.get("/genres", async (req, res) => {
     const genres = await Beat.distinct("genre");
 
     // Set longer cache for genres as they don't change often
-    res.setHeader('Cache-Control', 'public, max-age=3600'); // 1 hour
+    res.setHeader('Cache-Control', 'public, max-age=3600');
     res.json(["all", ...genres.sort()]);
   } catch (e) {
     console.error("Error fetching genres:", e);
@@ -907,7 +890,7 @@ app.get("/beats/featured", async (req, res) => {
     const featuredBeats = await Beat.find({ featured: true }).sort({ order: -1, date: -1 }).limit(5);
 
     // Set cache for featured beats
-    res.setHeader('Cache-Control', 'public, max-age=600'); // 10 minutes
+    res.setHeader('Cache-Control', 'public, max-age=600');
     res.json(addBaseUrlToBeats(featuredBeats));
   } catch (e) {
     console.error("Error fetching featured beats:", e);
@@ -950,8 +933,7 @@ app.post("/api/create-payment", async (req, res) => {
     });
     await purchase.save();
 
-    // In a real implementation, you would integrate with YooKassa here
-    // For now, we'll return a mock response
+    // Mock payment data
     const mockPaymentData = {
       id: paymentId,
       status: 'pending',
@@ -1070,11 +1052,24 @@ app.use((req, res) => {
   res.status(404).json({ message: "Endpoint not found" });
 });
 
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`Server running on port ${PORT}`);
-  console.log(`Environment: ${NODE_ENV}`);
-  console.log(`Frontend URL: ${FRONTEND_URL}`);
-  console.log(`Base URL: ${BASE_URL}`);
-  console.log(`Storage Type: ${STORAGE_TYPE}`);
-  console.log(`Health check: http://0.0.0.0:${PORT}/health`);
+// Create HTTP server
+const server = http.createServer(app);
+
+server.listen(PORT, "0.0.0.0", () => {
+  console.log(`✅ HTTP Server running on port ${PORT}`);
+  console.log(`🌍 Environment: ${NODE_ENV}`);
+  console.log(`🔗 Frontend URL: ${FRONTEND_URL}`);
+  console.log(`🔗 Base URL: ${BASE_URL}`);
+  console.log(`💾 Storage Type: ${STORAGE_TYPE}`);
+  console.log(`❤️  Health check: http://0.0.0.0:${PORT}/health`);
+  console.log(`📝 Admin login: http://0.0.0.0:${PORT}/admin/login`);
+});
+
+// Graceful shutdown
+process.on('SIGTERM', () => {
+  console.log('SIGTERM received, shutting down gracefully');
+  server.close(() => {
+    mongoose.connection.close();
+    console.log('Process terminated');
+  });
 });
